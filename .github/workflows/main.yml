@@ -31,7 +31,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: apps/desktop-electron/package-lock.json
       - name: Install deps
@@ -40,3 +40,5 @@ jobs:
         run: cd apps/desktop-electron && npm run typecheck
       - name: Build
         run: cd apps/desktop-electron && npx electron-vite build
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096

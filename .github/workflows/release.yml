@@ -55,7 +55,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: apps/desktop-electron/package-lock.json
 
@@ -67,6 +67,7 @@ jobs:
             libatk-bridge2.0-0 \
             libgtk-3-0 \
             libnss3 \
+            libpng-dev \
             libsecret-1-dev \
             libx11-dev \
             libxkbfile-dev \
@@ -87,6 +88,8 @@ jobs:
       - name: Build renderer
         run: npx electron-vite build
         working-directory: apps/desktop-electron
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
 
       - name: Build sidecar
         run: cargo build -p taskloop-sidecar --release
