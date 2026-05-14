@@ -1,0 +1,1659 @@
+import type React from 'react'
+import { create } from 'zustand'
+import { createJSONStorage, persist } from 'zustand/middleware'
+import {
+  BOTTOM_TERMINAL_DOCK_DEFAULT_HEIGHT,
+  LEFT_SIDEBAR_DEFAULT_WIDTH,
+  WORKING_FOLDER_PANEL_DEFAULT_WIDTH,
+  clampBottomTerminalDockHeight,
+  clampLeftSidebarWidth,
+  clampRightPanelWidth,
+  clampWorkingFolderPanelWidth
+} from '@renderer/components/layout/right-panel-defs'
+import { ipcStorage } from '@renderer/lib/ipc/ipc-storage'
+import { parseChatRoute, replaceChatRoute } from '@renderer/lib/chat-route'
+import { useChatStore } from '@renderer/stores/chat-store'
+
+export type AppMode = 'chat' | 'clarify' | 'agent' | 'code' | 'acp'
+
+export type NavItem = 'threads' | 'projects' | 'studio' | 'connections' | 'automations'
+
+export type ChatView = 'home' | 'project' | 'archive' | 'session'
+
+export type LegacyRightPanelTab =
+  | 'steps'
+  | 'orchestration'
+  | 'artifacts'
+  | 'context'
+  | 'files'
+  | 'plan'
+  | 'preview'
+  | 'browser'
+  | 'subagents'
+  | 'team'
+  | 'acp'
+export type RightPanelSection = 'execution' | 'resources' | 'collaboration' | 'monitoring'
+export type RightPanelTabKind = 'review' | 'preview' | 'browser' | 'subagent' | 'terminal'
+
+export interface RightPanelTabInstance {
+  id: string
+  kind: RightPanelTabKind
+  title: string
+  closable: boolean
+  sessionId?: string | null
+  toolUseId?: string | null
+  inlineText?: string | null
+  processId?: string
+  previewTabId?: string
+  initialChangeId?: string | null
+  modified?: boolean
+  createdAt: number
+}
+
+export type PreviewSource = 'file' | 'dev-server' | 'markdown'
+export type AutoModelRoute = 'main' | 'fast'
+export type AutoModelTaskType =
+  | 'rewrite'
+  | 'summarize'
+  | 'translate'
+  | 'format'
+  | 'qa'
+  | 'explain'
+  | 'compare'
+  | 'extract'
+  | 'plan'
+  | 'debug'
+  | 'implement'
+  | 'analyze'
+  | 'other'
+export type AutoModelConfidence = 'high' | 'medium' | 'low'
+export type AutoModelDecisionSource =
+  | 'classifier'
+  | 'legacy-classifier'
+  | 'fallback-main'
+  | 'fallback-fast'
+  | 'fallback-last-high-confidence'
+
+export interface AutoModelSelectionStatus {
+  source: 'auto'
+  mode?: AppMode
+  target: AutoModelRoute
+  providerId?: string
+  modelId?: string
+  providerName?: string
+  modelName?: string
+  taskType?: AutoModelTaskType
+  confidence?: AutoModelConfidence
+  decisionSource?: AutoModelDecisionSource
+  toolsAllowed?: boolean
+  fallbackReason?: string
+  selectedAt: number
+}
+
+export type AutoModelRoutingState = 'idle' | 'routing'
+
+export interface PreviewPanelState {
+  source: PreviewSource
+  filePath: string
+  viewMode: 'preview' | 'code'
+  viewerType: string
+  sshConnectionId?: string
+  port?: number
+  projectDir?: string
+  markdownContent?: string
+  markdownTitle?: string
+  targetLine?: number
+  targetColumn?: number
+  targetPositionKey?: number
+}
+
+export interface PreviewPanelTab extends PreviewPanelState {
+  id: string
+  title: string
+  modified?: boolean
+  draftContent?: string
+}
+
+export interface MessageListViewState {
+  scrollOffset: number
+  messageCount: number
+  loadedRangeStart: number
+  loadedRangeEnd: number
+}
+
+export interface BrowserErrorInfo {
+  code: number
+  desc: string
+  url: string
+}
+
+export interface BrowserPanelSessionState {
+  url: string
+  loading: boolean
+  pageTitle: string
+  canGoBack: boolean
+  canGoForward: boolean
+  errorInfo: BrowserErrorInfo | null
+}
+
+export type SettingsTab =
+  | 'general'
+  | 'models'
+  | 'agents'
+  | 'appearance'
+  | 'projectDefaults'
+  | 'security'
+  | 'system'
+  | 'memory'
+  | 'analytics'
+  | 'provider'
+  | 'modelManagement'
+  | 'model'
+  | 'mcp'
+  | 'connections'
+  | 'websearch'
+  | 'browser'
+  | 'skillsmarket'
+  | 'skills'
+  | 'automations'
+  | 'dataStorage'
+  | 'backups'
+  | 'about'
+
+export type DetailPanelContent =
+  | { type: 'team' }
+  | { type: 'subagent'; toolUseId?: string; text?: string }
+  | { type: 'terminal'; processId: string }
+  | { type: 'change-review'; runId: string; initialChangeId?: string | null }
+  | { type: 'document'; title: string; content: string }
+  | { type: 'report'; title: string; data: unknown }
+
+const RIGHT_PANEL_REVIEW_TAB_ID = 'review'
+
+function createReviewTab(initialChangeId?: string | null): RightPanelTabInstance {
+  return {
+    id: RIGHT_PANEL_REVIEW_TAB_ID,
+    kind: 'review',
+    title: 'Review',
+    closable: false,
+    initialChangeId: initialChangeId ?? null,
+    createdAt: 0
+  }
+}
+
+function ensureReviewTab(
+  tabs: RightPanelTabInstance[] | null | undefined,
+  initialChangeId?: string | null
+): RightPanelTabInstance[] {
+  const safeTabs = tabs ?? []
+  const existing = safeTabs.find((tab) => tab.id === RIGHT_PANEL_REVIEW_TAB_ID)
+  if (existing) {
+    return safeTabs.map((tab) =>
+      tab.id === RIGHT_PANEL_REVIEW_TAB_ID
+        ? {
+            ...tab,
+            initialChangeId: initialChangeId !== undefined ? initialChangeId : tab.initialChangeId
+          }
+        : tab
+    )
+  }
+  return [createReviewTab(initialChangeId), ...safeTabs]
+}
+
+function getDefaultRightPanelTabs(): RightPanelTabInstance[] {
+  return [createReviewTab()]
+}
+
+function keepGlobalRightPanelTabs(
+  tabs: RightPanelTabInstance[] | null | undefined
+): RightPanelTabInstance[] {
+  return ensureReviewTab(
+    (tabs ?? []).filter((tab) => tab.kind === 'review' || tab.kind === 'browser'),
+    null
+  )
+}
+
+function nextRightPanelActiveTab(
+  tabs: RightPanelTabInstance[] | null | undefined,
+  closedTabId: string
+): string {
+  const safeTabs = tabs ?? []
+  const index = safeTabs.findIndex((tab) => tab.id === closedTabId)
+  const nextTabs = safeTabs.filter((tab) => tab.id !== closedTabId)
+  return (
+    nextTabs[Math.min(Math.max(index, 0), nextTabs.length - 1)]?.id ?? RIGHT_PANEL_REVIEW_TAB_ID
+  )
+}
+
+function rightPanelPreviewTabId(previewTabId: string): string {
+  return `preview:${previewTabId}`
+}
+
+interface UIStore {
+  mode: AppMode
+  setMode: (mode: AppMode) => void
+  activeNavItem: NavItem
+  setActiveNavItem: (item: NavItem) => void
+  leftSidebarOpen: boolean
+  leftSidebarWidth: number
+  toggleLeftSidebar: () => void
+  setLeftSidebarOpen: (open: boolean) => void
+  setLeftSidebarWidth: (width: number) => void
+  rightPanelOpen: boolean
+  toggleRightPanel: () => void
+  setRightPanelOpen: (open: boolean) => void
+  workingFolderSheetOpen: boolean
+  toggleWorkingFolderSheet: () => void
+  setWorkingFolderSheetOpen: (open: boolean) => void
+  workingFolderPanelWidth: number
+  setWorkingFolderPanelWidth: (width: number) => void
+  bottomTerminalDockOpenByProjectId: Record<string, boolean>
+  setBottomTerminalDockOpen: (projectId: string, open: boolean) => void
+  toggleBottomTerminalDock: (projectId: string) => void
+  isBottomTerminalDockOpen: (projectId?: string | null) => boolean
+  bottomTerminalDockHeight: number
+  setBottomTerminalDockHeight: (height: number) => void
+  rightPanelTab: LegacyRightPanelTab
+  setRightPanelTab: (tab: LegacyRightPanelTab) => void
+  rightPanelSection: RightPanelSection
+  setRightPanelSection: (section: RightPanelSection) => void
+  rightPanelTabs: RightPanelTabInstance[]
+  rightPanelActiveTabId: string
+  setRightPanelActiveTab: (tabId: string) => void
+  openReviewTab: (initialChangeId?: string | null) => void
+  ensureBrowserTab: (url?: string, sessionId?: string | null) => void
+  ensureSubAgentTab: (
+    toolUseId?: string | null,
+    inlineText?: string | null,
+    title?: string | null
+  ) => void
+  ensureTerminalTab: (processId: string, title?: string | null) => void
+  closeRightPanelTab: (tabId: string) => void
+  rightPanelWidth: number
+  setRightPanelWidth: (width: number) => void
+  isHoveringRightPanel: boolean
+  setIsHoveringRightPanel: (hovering: boolean) => void
+  settingsOpen: boolean
+  setSettingsOpen: (open: boolean) => void
+  settingsPageOpen: boolean
+  settingsTab: SettingsTab
+  openSettingsPage: (tab?: SettingsTab) => void
+  closeSettingsPage: () => void
+  setSettingsTab: (tab: SettingsTab) => void
+  skillsPageOpen: boolean
+  openSkillsPage: () => void
+  closeSkillsPage: () => void
+  resourcesPageOpen: boolean
+  openResourcesPage: () => void
+  closeResourcesPage: () => void
+  translatePageOpen: boolean
+  openTranslatePage: () => void
+  closeTranslatePage: () => void
+  drawPageOpen: boolean
+  openDrawPage: () => void
+  closeDrawPage: () => void
+  tasksPageOpen: boolean
+  openTasksPage: () => void
+  closeTasksPage: () => void
+  studioPageOpen: boolean
+  openStudioPage: () => void
+  closeStudioPage: () => void
+  connectionsPageOpen: boolean
+  openConnectionsPage: () => void
+  closeConnectionsPage: () => void
+  shortcutsOpen: boolean
+  setShortcutsOpen: (open: boolean) => void
+  conversationGuideOpen: boolean
+  setConversationGuideOpen: (open: boolean) => void
+  pendingInsertText: string | null
+  setPendingInsertText: (text: string | null) => void
+  detailPanelOpen: boolean
+  detailPanelContent: DetailPanelContent | null
+  openDetailPanel: (content: DetailPanelContent) => void
+  closeDetailPanel: () => void
+  previewPanelOpen: boolean
+  previewPanelState: PreviewPanelState | null
+  previewPanelTabs: PreviewPanelTab[]
+  activePreviewPanelTabId: string | null
+  openFilePreview: (
+    filePath: string,
+    viewMode?: 'preview' | 'code',
+    sshConnectionId?: string,
+    sessionId?: string | null,
+    targetLine?: number,
+    targetColumn?: number
+  ) => void
+  openDevServerPreview: (projectDir: string, port: number, sessionId?: string | null) => void
+  openMarkdownPreview: (title: string, content: string, sessionId?: string | null) => void
+  openPreviewTab: (state: PreviewPanelState, preserveExistingViewMode?: boolean) => void
+  closePreviewTab: (tabId: string) => void
+  setActivePreviewTab: (tabId: string | null) => void
+  updatePreviewTab: (tabId: string, patch: Partial<PreviewPanelTab>) => void
+  closePreviewPanel: (sessionId?: string | null) => void
+  setPreviewViewMode: (mode: 'preview' | 'code', sessionId?: string | null) => void
+  activeScopedSessionId: string | null
+  syncSessionScopedState: (sessionId: string | null) => void
+  messageListViewStatesBySession: Record<string, MessageListViewState | undefined>
+  setMessageListViewState: (sessionId: string, state: MessageListViewState | null) => void
+  getMessageListViewState: (sessionId?: string | null) => MessageListViewState | null
+  releaseDormantSessionUiState: (sessionId?: string | null) => void
+  autoModelSelectionsBySession: Record<string, AutoModelSelectionStatus | null>
+  autoModelHighConfidenceSelectionsBySession: Record<string, AutoModelSelectionStatus | null>
+  autoModelRoutingStatesBySession: Record<string, AutoModelRoutingState>
+  setAutoModelSelection: (sessionId: string, status: AutoModelSelectionStatus | null) => void
+  getAutoModelSelection: (sessionId?: string | null) => AutoModelSelectionStatus | null
+  setAutoModelHighConfidenceSelection: (
+    sessionId: string,
+    status: AutoModelSelectionStatus | null
+  ) => void
+  getAutoModelHighConfidenceSelection: (
+    sessionId?: string | null
+  ) => AutoModelSelectionStatus | null
+  setAutoModelRoutingState: (sessionId: string, status: AutoModelRoutingState) => void
+  getAutoModelRoutingState: (sessionId?: string | null) => AutoModelRoutingState
+  selectedFiles: string[]
+  setSelectedFiles: (files: string[]) => void
+  toggleFileSelection: (filePath: string) => void
+  clearSelectedFiles: () => void
+  selectedOrchestrationRunId: string | null
+  selectedOrchestrationMemberId: string | null
+  orchestrationConsoleOpen: boolean
+  orchestrationConsoleView: 'overview' | 'member' | 'tasks'
+  openOrchestrationPanel: (runId?: string | null, memberId?: string | null) => void
+  openOrchestrationMember: (runId: string, memberId?: string | null) => void
+  closeOrchestrationPanel: () => void
+  openSubAgentsPanel: (toolUseId?: string | null) => void
+  browserStatesBySession: Record<string, BrowserPanelSessionState | undefined>
+  getBrowserState: (sessionId?: string | null) => BrowserPanelSessionState
+  patchBrowserState: (
+    sessionId: string | null | undefined,
+    patch: Partial<BrowserPanelSessionState>
+  ) => void
+  browserUrl: string
+  setBrowserUrl: (url: string, sessionId?: string | null) => void
+  openBrowserTab: (url?: string, sessionId?: string | null) => void
+  browserLoading: boolean
+  setBrowserLoading: (loading: boolean, sessionId?: string | null) => void
+  browserPageTitle: string
+  setBrowserPageTitle: (title: string, sessionId?: string | null) => void
+  browserCanGoBack: boolean
+  setBrowserCanGoBack: (can: boolean, sessionId?: string | null) => void
+  browserCanGoForward: boolean
+  setBrowserCanGoForward: (can: boolean, sessionId?: string | null) => void
+  browserErrorInfo: BrowserErrorInfo | null
+  setBrowserErrorInfo: (info: BrowserErrorInfo | null, sessionId?: string | null) => void
+  browserWebviewRefsBySession: Record<
+    string,
+    React.RefObject<Electron.WebviewTag | null> | null | undefined
+  >
+  getBrowserWebviewRef: (
+    sessionId?: string | null
+  ) => React.RefObject<Electron.WebviewTag | null> | null
+  browserWebviewRef: React.RefObject<Electron.WebviewTag | null> | null
+  setBrowserWebviewRef: (
+    ref: React.RefObject<Electron.WebviewTag | null> | null,
+    sessionId?: string | null
+  ) => void
+  subAgentExecutionDetailOpen: boolean
+  subAgentExecutionDetailToolUseId: string | null
+  subAgentExecutionDetailInlineText: string | null
+  openSubAgentExecutionDetail: (
+    toolUseId: string,
+    inlineText?: string | null,
+    title?: string | null
+  ) => void
+  closeSubAgentExecutionDetail: () => void
+  selectedSubAgentToolUseId: string | null
+  setSelectedSubAgentToolUseId: (toolUseId: string | null) => void
+  setSelectedOrchestrationRunId: (runId: string | null) => void
+  setSelectedOrchestrationMemberId: (memberId: string | null) => void
+  setOrchestrationConsoleView: (view: 'overview' | 'member' | 'tasks') => void
+  planMode: boolean
+  enterPlanMode: (sessionId?: string | null) => void
+  exitPlanMode: (sessionId?: string | null) => void
+  planModesBySession: Record<string, boolean>
+  isPlanModeEnabled: (sessionId?: string | null) => boolean
+  chatView: ChatView
+  navigateToHome: () => void
+  navigateToProject: (projectId?: string | null) => void
+  navigateToArchive: (projectId?: string | null) => void
+  navigateToChannels: (projectId?: string | null) => void
+  navigateToGit: (projectId?: string | null) => void
+  navigateToSession: (sessionId?: string | null) => void
+  applyChatRouteFromLocation: () => void
+}
+
+const GLOBAL_BROWSER_SESSION_KEY = '__global__'
+
+const DEFAULT_BROWSER_STATE: BrowserPanelSessionState = {
+  url: '',
+  loading: false,
+  pageTitle: '',
+  canGoBack: false,
+  canGoForward: false,
+  errorInfo: null
+}
+
+function getBrowserSessionKey(sessionId?: string | null): string {
+  const trimmed = sessionId?.trim()
+  return trimmed || GLOBAL_BROWSER_SESSION_KEY
+}
+
+function resolveBrowserSessionId(
+  state: Pick<UIStore, 'activeScopedSessionId'>,
+  sessionId?: string | null
+): string | null {
+  if (sessionId !== undefined) return sessionId
+  return state.activeScopedSessionId ?? useChatStore.getState().activeSessionId ?? null
+}
+
+function getBrowserStateFromMap(
+  states: Record<string, BrowserPanelSessionState | undefined> | null | undefined,
+  sessionId?: string | null
+): BrowserPanelSessionState {
+  return states?.[getBrowserSessionKey(sessionId)] ?? DEFAULT_BROWSER_STATE
+}
+
+function isActiveBrowserSession(
+  state: Pick<UIStore, 'activeScopedSessionId'>,
+  sessionId?: string | null
+): boolean {
+  const activeSessionId = resolveBrowserSessionId(state, undefined)
+  return getBrowserSessionKey(activeSessionId) === getBrowserSessionKey(sessionId)
+}
+
+function browserAliasState(
+  browserState: BrowserPanelSessionState
+): Pick<
+  UIStore,
+  | 'browserUrl'
+  | 'browserLoading'
+  | 'browserPageTitle'
+  | 'browserCanGoBack'
+  | 'browserCanGoForward'
+  | 'browserErrorInfo'
+> {
+  return {
+    browserUrl: browserState.url,
+    browserLoading: browserState.loading,
+    browserPageTitle: browserState.pageTitle,
+    browserCanGoBack: browserState.canGoBack,
+    browserCanGoForward: browserState.canGoForward,
+    browserErrorInfo: browserState.errorInfo
+  }
+}
+
+function updateBrowserStateForSession(
+  state: Pick<UIStore, 'activeScopedSessionId' | 'browserStatesBySession'>,
+  sessionId: string | null | undefined,
+  patch: Partial<BrowserPanelSessionState>
+): Partial<UIStore> {
+  const resolvedSessionId = resolveBrowserSessionId(state, sessionId)
+  const key = getBrowserSessionKey(resolvedSessionId)
+  const browserStatesBySession = state.browserStatesBySession ?? {}
+  const nextBrowserState = {
+    ...getBrowserStateFromMap(browserStatesBySession, resolvedSessionId),
+    ...patch
+  }
+  return {
+    browserStatesBySession: {
+      ...browserStatesBySession,
+      [key]: nextBrowserState
+    },
+    ...(isActiveBrowserSession(state, resolvedSessionId) ? browserAliasState(nextBrowserState) : {})
+  }
+}
+
+const CHAT_SURFACE_NAV_RESET = {
+  settingsPageOpen: false,
+  skillsPageOpen: false,
+  resourcesPageOpen: false,
+  translatePageOpen: false,
+  drawPageOpen: false,
+  tasksPageOpen: false,
+  studioPageOpen: false,
+  connectionsPageOpen: false
+} as const
+
+function buildFilePreviewState(
+  filePath: string,
+  viewMode?: 'preview' | 'code',
+  sshConnectionId?: string,
+  targetLine?: number,
+  targetColumn?: number
+): PreviewPanelState {
+  const pathWithoutQuery = filePath.split(/[?#]/)[0] ?? filePath
+  const ext =
+    pathWithoutQuery.lastIndexOf('.') >= 0
+      ? pathWithoutQuery.slice(pathWithoutQuery.lastIndexOf('.')).toLowerCase()
+      : ''
+  const onlineOfficeFile = /^https:\/\/\S+/i.test(filePath)
+  const previewExts = new Set(['.html', '.htm', '.xhtml', '.shtml'])
+  const spreadsheetExts = new Set(['.csv', '.tsv', '.xls', '.xlsx', '.xlsm', '.xlsb', '.ods'])
+  const markdownExts = new Set(['.md', '.mdx', '.markdown', '.mdown', '.mkd', '.mkdn', '.mdwn'])
+  const imageExts = new Set([
+    '.png',
+    '.jpg',
+    '.jpeg',
+    '.jfif',
+    '.pjpeg',
+    '.pjp',
+    '.gif',
+    '.apng',
+    '.bmp',
+    '.webp',
+    '.avif',
+    '.ico',
+    '.cur',
+    '.tif',
+    '.tiff',
+    '.heic',
+    '.heif',
+    '.jxl'
+  ])
+  const videoExts = new Set([
+    '.mp4',
+    '.webm',
+    '.ogv',
+    '.mov',
+    '.m4v',
+    '.mkv',
+    '.avi',
+    '.mpeg',
+    '.mpg',
+    '.3gp',
+    '.3g2',
+    '.mts',
+    '.m2ts'
+  ])
+  const audioExts = new Set([
+    '.mp3',
+    '.wav',
+    '.wave',
+    '.ogg',
+    '.oga',
+    '.m4a',
+    '.aac',
+    '.flac',
+    '.opus',
+    '.weba',
+    '.aif',
+    '.aiff'
+  ])
+  const svgExts = new Set(['.svg'])
+  const fontExts = new Set(['.ttf', '.otf', '.woff', '.woff2'])
+  const docxExts = new Set(['.docx', '.docm', '.dotx', '.dotm'])
+  const officeOnlineExts = new Set([
+    '.doc',
+    '.docx',
+    '.docm',
+    '.dotx',
+    '.dotm',
+    '.ppt',
+    '.pptx',
+    '.pps',
+    '.ppsx',
+    '.odp',
+    '.odt',
+    '.ott',
+    '.rtf',
+    '.xls',
+    '.xlsx',
+    '.xlsm'
+  ])
+  const pdfExts = new Set(['.pdf'])
+  const binaryExts = new Set([
+    '.zip',
+    '.rar',
+    '.7z',
+    '.tar',
+    '.gz',
+    '.tgz',
+    '.bz2',
+    '.xz',
+    '.zst',
+    '.jar',
+    '.war',
+    '.ear',
+    '.dmg',
+    '.iso',
+    '.img',
+    '.exe',
+    '.msi',
+    '.dll',
+    '.so',
+    '.dylib',
+    '.bin',
+    '.dat',
+    '.sqlite',
+    '.sqlite3',
+    '.db'
+  ])
+  let viewerType = 'fallback'
+  if (onlineOfficeFile && officeOnlineExts.has(ext)) viewerType = 'office-online'
+  else if (previewExts.has(ext)) viewerType = 'html'
+  else if (spreadsheetExts.has(ext)) viewerType = 'spreadsheet'
+  else if (markdownExts.has(ext)) viewerType = 'markdown'
+  else if (svgExts.has(ext)) viewerType = 'svg'
+  else if (imageExts.has(ext)) viewerType = 'image'
+  else if (videoExts.has(ext)) viewerType = 'video'
+  else if (audioExts.has(ext)) viewerType = 'audio'
+  else if (fontExts.has(ext)) viewerType = 'font'
+  else if (docxExts.has(ext)) viewerType = 'docx'
+  else if (officeOnlineExts.has(ext)) viewerType = 'office-online'
+  else if (pdfExts.has(ext)) viewerType = 'pdf'
+  else if (binaryExts.has(ext)) viewerType = 'binary'
+  const previewTypes = new Set([
+    'html',
+    'markdown',
+    'svg',
+    'docx',
+    'office-online',
+    'pdf',
+    'image',
+    'video',
+    'audio',
+    'font',
+    'binary',
+    'spreadsheet'
+  ])
+  const defaultMode = previewTypes.has(viewerType) ? 'preview' : 'code'
+
+  return {
+    source: 'file',
+    filePath,
+    viewMode: viewMode ?? (targetLine ? 'code' : defaultMode),
+    viewerType,
+    sshConnectionId: sshConnectionId || undefined,
+    targetLine,
+    targetColumn,
+    targetPositionKey: targetLine ? Date.now() : undefined
+  }
+}
+
+function previewTabId(state: PreviewPanelState): string {
+  if (state.source === 'file') {
+    return `file:${state.sshConnectionId ?? 'local'}:${state.filePath}`
+  }
+  if (state.source === 'dev-server') {
+    return `dev-server:${state.projectDir ?? ''}:${state.port ?? ''}`
+  }
+  return `markdown:${state.markdownTitle ?? ''}`
+}
+
+function previewTabTitle(state: PreviewPanelState): string {
+  if (state.source === 'markdown') return state.markdownTitle || 'Markdown Preview'
+  if (state.source === 'dev-server') return state.port ? `localhost:${state.port}` : 'Dev Server'
+  return state.filePath.split(/[\\/]/).pop() || state.filePath
+}
+
+function withPreviewTab(state: PreviewPanelState): PreviewPanelTab {
+  return {
+    ...state,
+    id: previewTabId(state),
+    title: previewTabTitle(state)
+  }
+}
+
+function activatePreviewTab(
+  tabs: PreviewPanelTab[],
+  activeId: string | null
+): PreviewPanelTab | null {
+  if (!activeId) return null
+  return tabs.find((tab) => tab.id === activeId) ?? null
+}
+
+export const useUIStore = create<UIStore>()(
+  persist(
+    (set, get) => ({
+      mode: 'agent',
+      setMode: (mode) => set({ mode }),
+      activeNavItem: 'threads',
+      setActiveNavItem: (item) =>
+        set({ activeNavItem: item, leftSidebarOpen: true, rightPanelOpen: false }),
+      leftSidebarOpen: true,
+      leftSidebarWidth: LEFT_SIDEBAR_DEFAULT_WIDTH,
+      toggleLeftSidebar: () => set((state) => ({ leftSidebarOpen: !state.leftSidebarOpen })),
+      setLeftSidebarOpen: (open) => set({ leftSidebarOpen: open }),
+      setLeftSidebarWidth: (width) => set({ leftSidebarWidth: clampLeftSidebarWidth(width) }),
+      rightPanelOpen: false,
+      toggleRightPanel: () =>
+        set((state) => {
+          const nextOpen = !state.rightPanelOpen
+          if (!nextOpen) return { rightPanelOpen: false }
+          const rightPanelTabs = ensureReviewTab(state.rightPanelTabs, null)
+          return {
+            rightPanelOpen: true,
+            rightPanelTabs,
+            rightPanelActiveTabId: RIGHT_PANEL_REVIEW_TAB_ID
+          }
+        }),
+      setRightPanelOpen: (open) =>
+        set((state) => {
+          if (!open) return { rightPanelOpen: false }
+          const rightPanelTabs = ensureReviewTab(state.rightPanelTabs, null)
+          return {
+            rightPanelOpen: true,
+            rightPanelTabs,
+            rightPanelActiveTabId: RIGHT_PANEL_REVIEW_TAB_ID
+          }
+        }),
+      workingFolderSheetOpen: false,
+      toggleWorkingFolderSheet: () =>
+        set((state) => ({ workingFolderSheetOpen: !state.workingFolderSheetOpen })),
+      setWorkingFolderSheetOpen: (open) => set({ workingFolderSheetOpen: open }),
+      workingFolderPanelWidth: WORKING_FOLDER_PANEL_DEFAULT_WIDTH,
+      setWorkingFolderPanelWidth: (width) =>
+        set({ workingFolderPanelWidth: clampWorkingFolderPanelWidth(width) }),
+      bottomTerminalDockOpenByProjectId: {},
+      bottomTerminalDockHeight: BOTTOM_TERMINAL_DOCK_DEFAULT_HEIGHT,
+      setBottomTerminalDockOpen: (projectId, open) =>
+        set((state) => ({
+          bottomTerminalDockOpenByProjectId: {
+            ...state.bottomTerminalDockOpenByProjectId,
+            [projectId]: open
+          }
+        })),
+      toggleBottomTerminalDock: (projectId) =>
+        set((state) => ({
+          bottomTerminalDockOpenByProjectId: {
+            ...state.bottomTerminalDockOpenByProjectId,
+            [projectId]: !state.bottomTerminalDockOpenByProjectId[projectId]
+          }
+        })),
+      isBottomTerminalDockOpen: (projectId) =>
+        projectId ? Boolean(get().bottomTerminalDockOpenByProjectId[projectId]) : false,
+      setBottomTerminalDockHeight: (height) =>
+        set({ bottomTerminalDockHeight: clampBottomTerminalDockHeight(height) }),
+      rightPanelTab: 'preview',
+      setRightPanelTab: (tab) => {
+        if (tab === 'browser') {
+          get().ensureBrowserTab()
+          return
+        }
+        if (tab === 'subagents') {
+          get().ensureSubAgentTab()
+          return
+        }
+        if (tab === 'team' || tab === 'orchestration') {
+          get().openOrchestrationPanel()
+          return
+        }
+        get().openReviewTab()
+        set({ rightPanelTab: tab })
+      },
+      rightPanelSection: 'execution',
+      setRightPanelSection: (section) => set({ rightPanelSection: section }),
+      rightPanelTabs: getDefaultRightPanelTabs(),
+      rightPanelActiveTabId: RIGHT_PANEL_REVIEW_TAB_ID,
+      setRightPanelActiveTab: (tabId) =>
+        set((state) => {
+          const rightPanelTabs = ensureReviewTab(state.rightPanelTabs)
+          const targetTab = rightPanelTabs.find((tab) => tab.id === tabId)
+          if (!targetTab) {
+            return {
+              rightPanelTabs,
+              rightPanelActiveTabId: RIGHT_PANEL_REVIEW_TAB_ID,
+              rightPanelOpen: true
+            }
+          }
+          return {
+            rightPanelTabs,
+            rightPanelActiveTabId: tabId,
+            rightPanelOpen: true,
+            ...(targetTab.kind === 'preview' && targetTab.previewTabId
+              ? {
+                  activePreviewPanelTabId: targetTab.previewTabId,
+                  previewPanelState: activatePreviewTab(
+                    state.previewPanelTabs,
+                    targetTab.previewTabId
+                  ),
+                  previewPanelOpen: true,
+                  detailPanelOpen: false,
+                  detailPanelContent: null
+                }
+              : {})
+          }
+        }),
+      openReviewTab: (initialChangeId) =>
+        set((state) => ({
+          rightPanelTabs: ensureReviewTab(state.rightPanelTabs, initialChangeId ?? null),
+          rightPanelActiveTabId: RIGHT_PANEL_REVIEW_TAB_ID,
+          rightPanelTab: 'preview',
+          rightPanelOpen: true
+        })),
+      ensureBrowserTab: (url, sessionId) =>
+        set((state) => {
+          const existing = state.rightPanelTabs.find((tab) => tab.kind === 'browser')
+          const tab: RightPanelTabInstance = existing ?? {
+            id: 'browser',
+            kind: 'browser',
+            title: 'Browser',
+            closable: true,
+            createdAt: Date.now()
+          }
+          const rightPanelTabs = existing
+            ? ensureReviewTab(state.rightPanelTabs)
+            : ensureReviewTab([...state.rightPanelTabs, tab])
+          return {
+            rightPanelTabs,
+            rightPanelActiveTabId: tab.id,
+            rightPanelTab: 'browser',
+            rightPanelOpen: true,
+            ...updateBrowserStateForSession(state, sessionId, {
+              errorInfo: null,
+              ...(url !== undefined ? { url } : {})
+            })
+          }
+        }),
+      ensureSubAgentTab: (toolUseId, inlineText, title) =>
+        set((state) => {
+          const tabId = toolUseId ? `subagent:${toolUseId}` : 'subagent:overview'
+          const sessionId =
+            state.activeScopedSessionId ?? useChatStore.getState().activeSessionId ?? null
+          const existing = state.rightPanelTabs.find((tab) => tab.id === tabId)
+          const tab: RightPanelTabInstance = existing
+            ? {
+                ...existing,
+                title: title?.trim() || existing.title,
+                inlineText: inlineText?.trim() ? inlineText : existing.inlineText
+              }
+            : {
+                id: tabId,
+                kind: 'subagent',
+                title: title?.trim() || (toolUseId ? 'SubAgent' : 'SubAgents'),
+                closable: true,
+                sessionId,
+                toolUseId: toolUseId ?? null,
+                inlineText: inlineText?.trim() ? inlineText : null,
+                createdAt: Date.now()
+              }
+          const rightPanelTabs = ensureReviewTab(
+            existing
+              ? state.rightPanelTabs.map((item) => (item.id === tabId ? tab : item))
+              : [...state.rightPanelTabs, tab]
+          )
+          return {
+            selectedSubAgentToolUseId: toolUseId ?? null,
+            subAgentExecutionDetailOpen: false,
+            subAgentExecutionDetailToolUseId: toolUseId ?? null,
+            subAgentExecutionDetailInlineText: inlineText?.trim() ? inlineText : null,
+            orchestrationConsoleOpen: false,
+            rightPanelTabs,
+            rightPanelActiveTabId: tabId,
+            rightPanelTab: 'subagents',
+            rightPanelOpen: true
+          }
+        }),
+      ensureTerminalTab: (processId, title) =>
+        set((state) => {
+          const tabId = `terminal:${processId}`
+          const sessionId =
+            state.activeScopedSessionId ?? useChatStore.getState().activeSessionId ?? null
+          const existing = state.rightPanelTabs.find((tab) => tab.id === tabId)
+          const tab: RightPanelTabInstance = existing ?? {
+            id: tabId,
+            kind: 'terminal',
+            title: title?.trim() || 'Terminal',
+            closable: true,
+            sessionId,
+            processId,
+            createdAt: Date.now()
+          }
+          const rightPanelTabs = existing
+            ? ensureReviewTab(state.rightPanelTabs)
+            : ensureReviewTab([...state.rightPanelTabs, tab])
+          return {
+            rightPanelTabs,
+            rightPanelActiveTabId: tabId,
+            rightPanelTab: 'context',
+            rightPanelOpen: true
+          }
+        }),
+      closeRightPanelTab: (tabId) =>
+        set((state) => {
+          if (tabId === RIGHT_PANEL_REVIEW_TAB_ID) return {}
+          const target = state.rightPanelTabs.find((tab) => tab.id === tabId)
+          const nextPreviewTabs =
+            target?.kind === 'preview' && target.previewTabId
+              ? state.previewPanelTabs.filter((tab) => tab.id !== target.previewTabId)
+              : state.previewPanelTabs
+          const nextRightPanelTabs = ensureReviewTab(
+            state.rightPanelTabs.filter((tab) => tab.id !== tabId)
+          )
+          const rightPanelActiveTabId =
+            state.rightPanelActiveTabId === tabId
+              ? nextRightPanelActiveTab(state.rightPanelTabs, tabId)
+              : state.rightPanelActiveTabId
+          const nextActiveRightPanelTab = nextRightPanelTabs.find(
+            (tab) => tab.id === rightPanelActiveTabId
+          )
+          const nextActivePreviewTabId =
+            nextActiveRightPanelTab?.kind === 'preview'
+              ? (nextActiveRightPanelTab.previewTabId ?? null)
+              : target?.kind === 'preview' && target.previewTabId === state.activePreviewPanelTabId
+                ? null
+                : state.activePreviewPanelTabId
+          return {
+            rightPanelTabs: nextRightPanelTabs,
+            rightPanelActiveTabId,
+            ...(target?.kind === 'preview'
+              ? {
+                  previewPanelTabs: nextPreviewTabs,
+                  activePreviewPanelTabId: nextActivePreviewTabId,
+                  previewPanelState: activatePreviewTab(nextPreviewTabs, nextActivePreviewTabId),
+                  previewPanelOpen: nextPreviewTabs.length > 0 ? state.previewPanelOpen : false
+                }
+              : {}),
+            ...(target?.kind === 'subagent'
+              ? {
+                  subAgentExecutionDetailOpen: false,
+                  subAgentExecutionDetailToolUseId: null,
+                  subAgentExecutionDetailInlineText: null
+                }
+              : {})
+          }
+        }),
+      rightPanelWidth: 384,
+      setRightPanelWidth: (width) => set({ rightPanelWidth: width }),
+      isHoveringRightPanel: false,
+      setIsHoveringRightPanel: (hovering) => set({ isHoveringRightPanel: hovering }),
+      settingsOpen: false,
+      setSettingsOpen: (open) => set({ settingsOpen: open }),
+      settingsPageOpen: false,
+      settingsTab: 'models',
+      openSettingsPage: (tab) =>
+        set({
+          settingsPageOpen: true,
+          settingsTab: tab ?? 'models',
+          skillsPageOpen: false,
+          resourcesPageOpen: false,
+          translatePageOpen: false,
+          drawPageOpen: false,
+          tasksPageOpen: false,
+          studioPageOpen: false,
+          connectionsPageOpen: false
+        }),
+      closeSettingsPage: () => set({ settingsPageOpen: false }),
+      setSettingsTab: (tab) => set({ settingsTab: tab }),
+      skillsPageOpen: false,
+      openSkillsPage: () =>
+        set({
+          activeNavItem: 'studio',
+          skillsPageOpen: true,
+          settingsPageOpen: false,
+          resourcesPageOpen: false,
+          translatePageOpen: false,
+          drawPageOpen: false,
+          tasksPageOpen: false,
+          studioPageOpen: false,
+          connectionsPageOpen: false
+        }),
+      closeSkillsPage: () => set({ skillsPageOpen: false }),
+      resourcesPageOpen: false,
+      openResourcesPage: () =>
+        set({
+          activeNavItem: 'studio',
+          resourcesPageOpen: true,
+          settingsPageOpen: false,
+          skillsPageOpen: false,
+          translatePageOpen: false,
+          drawPageOpen: false,
+          tasksPageOpen: false,
+          studioPageOpen: false,
+          connectionsPageOpen: false
+        }),
+      closeResourcesPage: () => set({ resourcesPageOpen: false }),
+      translatePageOpen: false,
+      openTranslatePage: () =>
+        set({
+          activeNavItem: 'threads',
+          translatePageOpen: true,
+          settingsPageOpen: false,
+          skillsPageOpen: false,
+          resourcesPageOpen: false,
+          drawPageOpen: false,
+          tasksPageOpen: false
+        }),
+      closeTranslatePage: () => set({ translatePageOpen: false }),
+      drawPageOpen: false,
+      openDrawPage: () =>
+        set({
+          activeNavItem: 'studio',
+          drawPageOpen: true,
+          settingsPageOpen: false,
+          skillsPageOpen: false,
+          resourcesPageOpen: false,
+          translatePageOpen: false,
+          tasksPageOpen: false
+        }),
+      closeDrawPage: () => set({ drawPageOpen: false }),
+      tasksPageOpen: false,
+      openTasksPage: () =>
+        set({
+          activeNavItem: 'automations',
+          tasksPageOpen: true,
+          settingsPageOpen: false,
+          skillsPageOpen: false,
+          resourcesPageOpen: false,
+          translatePageOpen: false,
+          drawPageOpen: false,
+          studioPageOpen: false,
+          connectionsPageOpen: false
+        }),
+      closeTasksPage: () => set({ tasksPageOpen: false }),
+      studioPageOpen: false,
+      openStudioPage: () =>
+        set({
+          activeNavItem: 'studio',
+          studioPageOpen: true,
+          settingsPageOpen: false,
+          skillsPageOpen: false,
+          resourcesPageOpen: false,
+          translatePageOpen: false,
+          drawPageOpen: false,
+          tasksPageOpen: false,
+          connectionsPageOpen: false
+        }),
+      closeStudioPage: () => set({ studioPageOpen: false }),
+      connectionsPageOpen: false,
+      openConnectionsPage: () =>
+        set({
+          activeNavItem: 'connections',
+          connectionsPageOpen: true,
+          settingsPageOpen: false,
+          skillsPageOpen: false,
+          resourcesPageOpen: false,
+          translatePageOpen: false,
+          drawPageOpen: false,
+          tasksPageOpen: false,
+          studioPageOpen: false
+        }),
+      closeConnectionsPage: () => set({ connectionsPageOpen: false }),
+      shortcutsOpen: false,
+      setShortcutsOpen: (open) => set({ shortcutsOpen: open }),
+      conversationGuideOpen: false,
+      setConversationGuideOpen: (open) => set({ conversationGuideOpen: open }),
+      pendingInsertText: null,
+      setPendingInsertText: (text) => set({ pendingInsertText: text }),
+      detailPanelOpen: false,
+      detailPanelContent: null,
+      openDetailPanel: (content) => {
+        if (content.type === 'change-review') {
+          set({ detailPanelOpen: false, detailPanelContent: content })
+          get().openReviewTab(content.initialChangeId ?? null)
+          return
+        }
+
+        if (content.type === 'terminal') {
+          set({ detailPanelOpen: false, detailPanelContent: content })
+          get().ensureTerminalTab(content.processId)
+          return
+        }
+
+        if (content.type === 'subagent') {
+          set({ detailPanelOpen: false, detailPanelContent: content })
+          get().ensureSubAgentTab(content.toolUseId ?? null, content.text ?? null)
+          return
+        }
+
+        set({
+          detailPanelOpen: true,
+          detailPanelContent: content,
+          previewPanelOpen: false,
+          previewPanelState: null,
+          rightPanelOpen: true
+        })
+      },
+      closeDetailPanel: () => set({ detailPanelOpen: false, detailPanelContent: null }),
+      previewPanelOpen: false,
+      previewPanelState: null,
+      previewPanelTabs: [],
+      activePreviewPanelTabId: null,
+      openPreviewTab: (previewState, preserveExistingViewMode = false) =>
+        set((state) => {
+          const nextTab = withPreviewTab(previewState)
+          const existing = state.previewPanelTabs.find((tab) => tab.id === nextTab.id)
+          const nextTabs = existing
+            ? state.previewPanelTabs.map((tab) =>
+                tab.id === nextTab.id
+                  ? {
+                      ...tab,
+                      ...nextTab,
+                      viewMode: preserveExistingViewMode ? tab.viewMode : nextTab.viewMode,
+                      modified: tab.modified,
+                      draftContent: tab.draftContent
+                    }
+                  : tab
+              )
+            : [...state.previewPanelTabs, nextTab]
+          const activePreviewPanelTabId = nextTab.id
+          const previewRightPanelTabId = rightPanelPreviewTabId(nextTab.id)
+          const existingRightPanelTab = state.rightPanelTabs.find(
+            (tab) => tab.id === previewRightPanelTabId
+          )
+          const rightPanelTab: RightPanelTabInstance = {
+            ...(existingRightPanelTab ?? {
+              id: previewRightPanelTabId,
+              kind: 'preview' as const,
+              closable: true,
+              createdAt: Date.now()
+            }),
+            title: previewTabTitle(nextTab),
+            previewTabId: nextTab.id,
+            modified: existing?.modified ?? nextTab.modified ?? false
+          }
+          const rightPanelTabs = ensureReviewTab(
+            existingRightPanelTab
+              ? state.rightPanelTabs.map((tab) =>
+                  tab.id === previewRightPanelTabId ? rightPanelTab : tab
+                )
+              : [...state.rightPanelTabs, rightPanelTab]
+          )
+          return {
+            previewPanelOpen: true,
+            previewPanelTabs: nextTabs,
+            activePreviewPanelTabId,
+            previewPanelState: activatePreviewTab(nextTabs, activePreviewPanelTabId),
+            detailPanelOpen: false,
+            detailPanelContent: null,
+            rightPanelTabs,
+            rightPanelActiveTabId: previewRightPanelTabId,
+            rightPanelOpen: true
+          }
+        }),
+      closePreviewTab: (tabId) =>
+        set((state) => {
+          const index = state.previewPanelTabs.findIndex((tab) => tab.id === tabId)
+          if (index < 0) return {}
+          const nextTabs = state.previewPanelTabs.filter((tab) => tab.id !== tabId)
+          const rightPanelTabId = rightPanelPreviewTabId(tabId)
+          const nextRightPanelTabs = ensureReviewTab(
+            state.rightPanelTabs.filter((tab) => tab.id !== rightPanelTabId)
+          )
+          const nextActiveId =
+            state.activePreviewPanelTabId === tabId
+              ? (nextTabs[Math.min(index, nextTabs.length - 1)]?.id ?? null)
+              : state.activePreviewPanelTabId
+          return {
+            previewPanelTabs: nextTabs,
+            activePreviewPanelTabId: nextActiveId,
+            previewPanelState: activatePreviewTab(nextTabs, nextActiveId),
+            previewPanelOpen: nextTabs.length > 0 ? state.previewPanelOpen : false,
+            rightPanelTabs: nextRightPanelTabs,
+            rightPanelActiveTabId:
+              state.rightPanelActiveTabId === rightPanelTabId
+                ? (nextRightPanelTabs.find(
+                    (tab) => tab.id === rightPanelPreviewTabId(nextActiveId ?? '')
+                  )?.id ?? RIGHT_PANEL_REVIEW_TAB_ID)
+                : state.rightPanelActiveTabId
+          }
+        }),
+      setActivePreviewTab: (tabId) =>
+        set((state) => {
+          const rightPanelTabId = tabId ? rightPanelPreviewTabId(tabId) : null
+          return {
+            activePreviewPanelTabId: tabId,
+            previewPanelState: activatePreviewTab(state.previewPanelTabs, tabId),
+            previewPanelOpen: tabId ? true : state.previewPanelOpen,
+            detailPanelOpen: tabId ? false : state.detailPanelOpen,
+            detailPanelContent: tabId ? null : state.detailPanelContent,
+            ...(rightPanelTabId && state.rightPanelTabs.some((tab) => tab.id === rightPanelTabId)
+              ? {
+                  rightPanelActiveTabId: rightPanelTabId,
+                  rightPanelOpen: true
+                }
+              : {})
+          }
+        }),
+      updatePreviewTab: (tabId, patch) =>
+        set((state) => {
+          const nextTabs = state.previewPanelTabs.map((tab) =>
+            tab.id === tabId ? { ...tab, ...patch } : tab
+          )
+          const updatedTab = nextTabs.find((tab) => tab.id === tabId)
+          const rightPanelTabId = rightPanelPreviewTabId(tabId)
+          return {
+            previewPanelTabs: nextTabs,
+            previewPanelState: activatePreviewTab(nextTabs, state.activePreviewPanelTabId),
+            rightPanelTabs: updatedTab
+              ? state.rightPanelTabs.map((tab) =>
+                  tab.id === rightPanelTabId
+                    ? {
+                        ...tab,
+                        title: previewTabTitle(updatedTab),
+                        modified: updatedTab.modified ?? false
+                      }
+                    : tab
+                )
+              : state.rightPanelTabs
+          }
+        }),
+      openFilePreview: (
+        filePath,
+        viewMode,
+        sshConnectionId,
+        _sessionId,
+        targetLine,
+        targetColumn
+      ) =>
+        get().openPreviewTab(
+          buildFilePreviewState(filePath, viewMode, sshConnectionId, targetLine, targetColumn),
+          viewMode === undefined && !targetLine
+        ),
+      openDevServerPreview: (projectDir, port) =>
+        get().openPreviewTab({
+          source: 'dev-server',
+          filePath: '',
+          viewMode: 'preview',
+          viewerType: 'dev-server',
+          port,
+          projectDir
+        }),
+      openMarkdownPreview: (title, content) =>
+        get().openPreviewTab({
+          source: 'markdown',
+          filePath: '',
+          viewMode: 'preview',
+          viewerType: 'markdown',
+          markdownContent: content,
+          markdownTitle: title
+        }),
+      closePreviewPanel: () => set({ previewPanelOpen: false }),
+      setPreviewViewMode: (mode) =>
+        set((state) => ({
+          previewPanelTabs: state.previewPanelTabs.map((tab) =>
+            tab.id === state.activePreviewPanelTabId ? { ...tab, viewMode: mode } : tab
+          ),
+          previewPanelState: state.previewPanelState
+            ? { ...state.previewPanelState, viewMode: mode }
+            : null
+        })),
+      activeScopedSessionId: null,
+      syncSessionScopedState: (sessionId) =>
+        set((state) => {
+          const sessionChanged = state.activeScopedSessionId !== sessionId
+          const browserState = getBrowserStateFromMap(state.browserStatesBySession, sessionId)
+          const browserWebviewRefsBySession = state.browserWebviewRefsBySession ?? {}
+          const planModesBySession = state.planModesBySession ?? {}
+          const browserWebviewRef =
+            browserWebviewRefsBySession[getBrowserSessionKey(sessionId)] ?? null
+          const scopedPanelState = sessionChanged
+            ? {
+                rightPanelTabs: keepGlobalRightPanelTabs(state.rightPanelTabs),
+                rightPanelActiveTabId: RIGHT_PANEL_REVIEW_TAB_ID,
+                subAgentExecutionDetailOpen: false,
+                subAgentExecutionDetailToolUseId: null,
+                subAgentExecutionDetailInlineText: null,
+                selectedSubAgentToolUseId: null
+              }
+            : {}
+          return {
+            activeScopedSessionId: sessionId,
+            planMode: sessionId ? (planModesBySession[sessionId] ?? false) : false,
+            browserWebviewRef,
+            ...browserAliasState(browserState),
+            ...scopedPanelState
+          }
+        }),
+      messageListViewStatesBySession: {},
+      setMessageListViewState: (sessionId, state) =>
+        set((current) => ({
+          messageListViewStatesBySession: state
+            ? { ...current.messageListViewStatesBySession, [sessionId]: state }
+            : Object.fromEntries(
+                Object.entries(current.messageListViewStatesBySession).filter(
+                  ([key]) => key !== sessionId
+                )
+              )
+        })),
+      getMessageListViewState: (sessionId) =>
+        sessionId ? (get().messageListViewStatesBySession[sessionId] ?? null) : null,
+      releaseDormantSessionUiState: (keepSessionId) =>
+        set((state) => {
+          const keep = (key: string): boolean => key === keepSessionId
+          const messageListViewStatesBySession = state.messageListViewStatesBySession ?? {}
+          const autoModelSelectionsBySession = state.autoModelSelectionsBySession ?? {}
+          const autoModelHighConfidenceSelectionsBySession =
+            state.autoModelHighConfidenceSelectionsBySession ?? {}
+          const autoModelRoutingStatesBySession = state.autoModelRoutingStatesBySession ?? {}
+          const planModesBySession = state.planModesBySession ?? {}
+          return {
+            messageListViewStatesBySession: Object.fromEntries(
+              Object.entries(messageListViewStatesBySession).filter(([k]) => keep(k))
+            ),
+            autoModelSelectionsBySession: Object.fromEntries(
+              Object.entries(autoModelSelectionsBySession).filter(([k]) => keep(k))
+            ),
+            autoModelHighConfidenceSelectionsBySession: Object.fromEntries(
+              Object.entries(autoModelHighConfidenceSelectionsBySession).filter(([k]) => keep(k))
+            ),
+            autoModelRoutingStatesBySession: Object.fromEntries(
+              Object.entries(autoModelRoutingStatesBySession).filter(([k]) => keep(k))
+            ),
+            planModesBySession: Object.fromEntries(
+              Object.entries(planModesBySession).filter(([k]) => keep(k))
+            )
+          }
+        }),
+      autoModelSelectionsBySession: {},
+      autoModelHighConfidenceSelectionsBySession: {},
+      autoModelRoutingStatesBySession: {},
+      setAutoModelSelection: (sessionId, status) =>
+        set((state) => ({
+          autoModelSelectionsBySession: {
+            ...state.autoModelSelectionsBySession,
+            [sessionId]: status
+          }
+        })),
+      getAutoModelSelection: (sessionId) =>
+        sessionId ? (get().autoModelSelectionsBySession[sessionId] ?? null) : null,
+      setAutoModelHighConfidenceSelection: (sessionId, status) =>
+        set((state) => ({
+          autoModelHighConfidenceSelectionsBySession: {
+            ...state.autoModelHighConfidenceSelectionsBySession,
+            [sessionId]: status
+          }
+        })),
+      getAutoModelHighConfidenceSelection: (sessionId) =>
+        sessionId ? (get().autoModelHighConfidenceSelectionsBySession[sessionId] ?? null) : null,
+      setAutoModelRoutingState: (sessionId, status) =>
+        set((state) => ({
+          autoModelRoutingStatesBySession: {
+            ...state.autoModelRoutingStatesBySession,
+            [sessionId]: status
+          }
+        })),
+      getAutoModelRoutingState: (sessionId) =>
+        sessionId ? (get().autoModelRoutingStatesBySession[sessionId] ?? 'idle') : 'idle',
+      selectedFiles: [],
+      setSelectedFiles: (files) => set({ selectedFiles: files }),
+      toggleFileSelection: (filePath) =>
+        set((state) => ({
+          selectedFiles: state.selectedFiles.includes(filePath)
+            ? state.selectedFiles.filter((file) => file !== filePath)
+            : [...state.selectedFiles, filePath]
+        })),
+      clearSelectedFiles: () => set({ selectedFiles: [] }),
+      selectedOrchestrationRunId: null,
+      selectedOrchestrationMemberId: null,
+      orchestrationConsoleOpen: false,
+      orchestrationConsoleView: 'overview',
+      openOrchestrationPanel: (runId, memberId) =>
+        set({
+          selectedOrchestrationRunId: runId ?? null,
+          selectedOrchestrationMemberId: memberId ?? null,
+          orchestrationConsoleOpen: true,
+          orchestrationConsoleView: memberId ? 'member' : 'overview',
+          rightPanelTab: 'orchestration',
+          rightPanelSection: 'collaboration',
+          rightPanelOpen: true
+        }),
+      openOrchestrationMember: (runId, memberId) =>
+        set({
+          selectedOrchestrationRunId: runId,
+          selectedOrchestrationMemberId: memberId ?? null,
+          orchestrationConsoleOpen: true,
+          orchestrationConsoleView: memberId ? 'member' : 'overview',
+          rightPanelTab: 'orchestration',
+          rightPanelSection: 'collaboration',
+          rightPanelOpen: true
+        }),
+      closeOrchestrationPanel: () =>
+        set({
+          orchestrationConsoleOpen: false,
+          selectedOrchestrationRunId: null,
+          selectedOrchestrationMemberId: null
+        }),
+      openSubAgentsPanel: (toolUseId) => get().ensureSubAgentTab(toolUseId ?? null),
+      browserStatesBySession: {},
+      getBrowserState: (sessionId) => {
+        const state = get()
+        return getBrowserStateFromMap(
+          state.browserStatesBySession,
+          resolveBrowserSessionId(state, sessionId)
+        )
+      },
+      patchBrowserState: (sessionId, patch) =>
+        set((state) => updateBrowserStateForSession(state, sessionId, patch)),
+      browserUrl: '',
+      setBrowserUrl: (url, sessionId) =>
+        set((state) => updateBrowserStateForSession(state, sessionId, { url })),
+      openBrowserTab: (url, sessionId) => get().ensureBrowserTab(url, sessionId),
+      browserLoading: false,
+      setBrowserLoading: (loading, sessionId) =>
+        set((state) => updateBrowserStateForSession(state, sessionId, { loading })),
+      browserPageTitle: '',
+      setBrowserPageTitle: (pageTitle, sessionId) =>
+        set((state) => updateBrowserStateForSession(state, sessionId, { pageTitle })),
+      browserCanGoBack: false,
+      setBrowserCanGoBack: (canGoBack, sessionId) =>
+        set((state) => updateBrowserStateForSession(state, sessionId, { canGoBack })),
+      browserCanGoForward: false,
+      setBrowserCanGoForward: (canGoForward, sessionId) =>
+        set((state) => updateBrowserStateForSession(state, sessionId, { canGoForward })),
+      browserErrorInfo: null,
+      setBrowserErrorInfo: (errorInfo, sessionId) =>
+        set((state) => updateBrowserStateForSession(state, sessionId, { errorInfo })),
+      browserWebviewRefsBySession: {},
+      getBrowserWebviewRef: (sessionId) => {
+        const state = get()
+        const resolvedSessionId = resolveBrowserSessionId(state, sessionId)
+        return state.browserWebviewRefsBySession[getBrowserSessionKey(resolvedSessionId)] ?? null
+      },
+      browserWebviewRef: null,
+      setBrowserWebviewRef: (ref, sessionId) =>
+        set((state) => {
+          const resolvedSessionId = resolveBrowserSessionId(state, sessionId)
+          const key = getBrowserSessionKey(resolvedSessionId)
+          const browserWebviewRefsBySession = { ...state.browserWebviewRefsBySession }
+          if (ref) {
+            browserWebviewRefsBySession[key] = ref
+          } else {
+            delete browserWebviewRefsBySession[key]
+          }
+          return {
+            browserWebviewRefsBySession,
+            ...(isActiveBrowserSession(state, resolvedSessionId) ? { browserWebviewRef: ref } : {})
+          }
+        }),
+      subAgentExecutionDetailOpen: false,
+      subAgentExecutionDetailToolUseId: null,
+      subAgentExecutionDetailInlineText: null,
+      openSubAgentExecutionDetail: (toolUseId, inlineText, title) =>
+        get().ensureSubAgentTab(toolUseId, inlineText ?? null, title ?? null),
+      closeSubAgentExecutionDetail: () =>
+        set({
+          subAgentExecutionDetailOpen: false,
+          subAgentExecutionDetailToolUseId: null,
+          subAgentExecutionDetailInlineText: null
+        }),
+      selectedSubAgentToolUseId: null,
+      setSelectedSubAgentToolUseId: (toolUseId) => set({ selectedSubAgentToolUseId: toolUseId }),
+      setSelectedOrchestrationRunId: (runId) => set({ selectedOrchestrationRunId: runId }),
+      setSelectedOrchestrationMemberId: (memberId) =>
+        set({
+          selectedOrchestrationMemberId: memberId,
+          orchestrationConsoleView: memberId ? 'member' : 'overview'
+        }),
+      setOrchestrationConsoleView: (view) => set({ orchestrationConsoleView: view }),
+      planMode: false,
+      enterPlanMode: (sessionId) =>
+        set((state) => {
+          const resolvedSessionId =
+            sessionId ?? state.activeScopedSessionId ?? useChatStore.getState().activeSessionId
+          return {
+            planMode: true,
+            planModesBySession: resolvedSessionId
+              ? { ...state.planModesBySession, [resolvedSessionId]: true }
+              : state.planModesBySession
+          }
+        }),
+      exitPlanMode: (sessionId) =>
+        set((state) => {
+          const resolvedSessionId =
+            sessionId ?? state.activeScopedSessionId ?? useChatStore.getState().activeSessionId
+          const nextPlanModesBySession = { ...state.planModesBySession }
+          if (resolvedSessionId) {
+            delete nextPlanModesBySession[resolvedSessionId]
+          }
+          const nextPlanMode = resolvedSessionId
+            ? Boolean(nextPlanModesBySession[resolvedSessionId])
+            : false
+          return {
+            planMode: nextPlanMode,
+            planModesBySession: nextPlanModesBySession
+          }
+        }),
+      planModesBySession: {},
+      isPlanModeEnabled: (sessionId) => {
+        const resolvedSessionId =
+          sessionId ?? get().activeScopedSessionId ?? useChatStore.getState().activeSessionId
+        if (!resolvedSessionId) return false
+        return Boolean(get().planModesBySession[resolvedSessionId])
+      },
+      chatView: 'home',
+      navigateToHome: () => {
+        set({ activeNavItem: 'threads', chatView: 'home', ...CHAT_SURFACE_NAV_RESET })
+        replaceChatRoute({ chatView: 'home', projectId: null, sessionId: null })
+      },
+      navigateToProject: (projectId) => {
+        const resolvedProjectId = projectId ?? useChatStore.getState().activeProjectId ?? null
+        set({ activeNavItem: 'threads', chatView: 'project', ...CHAT_SURFACE_NAV_RESET })
+        replaceChatRoute({ chatView: 'project', projectId: resolvedProjectId, sessionId: null })
+      },
+      navigateToArchive: (projectId) => {
+        const resolvedProjectId = projectId ?? useChatStore.getState().activeProjectId ?? null
+        set({ activeNavItem: 'threads', chatView: 'archive', ...CHAT_SURFACE_NAV_RESET })
+        replaceChatRoute({ chatView: 'archive', projectId: resolvedProjectId, sessionId: null })
+      },
+      navigateToChannels: (projectId) => {
+        const resolvedProjectId = projectId ?? useChatStore.getState().activeProjectId ?? null
+        set({ activeNavItem: 'threads', chatView: 'home', ...CHAT_SURFACE_NAV_RESET })
+        replaceChatRoute({ chatView: 'home', projectId: resolvedProjectId, sessionId: null })
+      },
+      navigateToGit: (projectId) => {
+        const resolvedProjectId = projectId ?? useChatStore.getState().activeProjectId ?? null
+        set({ activeNavItem: 'threads', chatView: 'project', ...CHAT_SURFACE_NAV_RESET })
+        replaceChatRoute({ chatView: 'project', projectId: resolvedProjectId, sessionId: null })
+      },
+      navigateToSession: (sessionId) => {
+        const store = useChatStore.getState()
+        const resolvedSessionId = sessionId ?? store.activeSessionId ?? null
+        const resolvedSession = resolvedSessionId
+          ? store.sessions.find((item) => item.id === resolvedSessionId)
+          : null
+        const resolvedProjectId = resolvedSession
+          ? (resolvedSession.projectId ?? null)
+          : (store.activeProjectId ?? null)
+        set({ activeNavItem: 'threads', chatView: 'session', ...CHAT_SURFACE_NAV_RESET })
+        replaceChatRoute({
+          chatView: resolvedSessionId ? 'session' : resolvedProjectId ? 'project' : 'home',
+          projectId: resolvedProjectId,
+          sessionId: resolvedSessionId
+        })
+      },
+      applyChatRouteFromLocation: () => {
+        const route = parseChatRoute(window.location.hash)
+        const chatStore = useChatStore.getState()
+        let resolvedRouteProjectId = route.projectId
+
+        if (route.projectId) {
+          const hasProject = chatStore.projects.some((project) => project.id === route.projectId)
+          if (hasProject) {
+            chatStore.setActiveProject(route.projectId)
+          } else {
+            resolvedRouteProjectId = null
+          }
+        }
+
+        if (route.sessionId) {
+          const session = chatStore.sessions.find((item) => item.id === route.sessionId)
+          if (session) {
+            chatStore.setActiveSession(session.id)
+            set({ activeNavItem: 'threads', chatView: 'session' })
+            replaceChatRoute({
+              chatView: 'session',
+              projectId: session.projectId ?? null,
+              sessionId: session.id
+            })
+            return
+          }
+        }
+
+        chatStore.setActiveSession(null)
+
+        if (route.chatView !== 'home') {
+          const resolvedProjectId = resolvedRouteProjectId ?? chatStore.activeProjectId ?? null
+          if (!resolvedProjectId) {
+            set({ activeNavItem: 'threads', chatView: 'home' })
+            replaceChatRoute({ chatView: 'home', projectId: null, sessionId: null })
+            return
+          }
+        }
+
+        set({ activeNavItem: 'threads', chatView: route.chatView })
+        replaceChatRoute({
+          chatView: route.chatView,
+          projectId: resolvedRouteProjectId ?? chatStore.activeProjectId ?? null,
+          sessionId: null
+        })
+      }
+    }),
+    {
+      name: 'agentboard-ui-state',
+      version: 1,
+      storage: createJSONStorage(() => ipcStorage),
+      partialize: (state) => ({
+        leftSidebarOpen: state.leftSidebarOpen,
+        leftSidebarWidth: clampLeftSidebarWidth(state.leftSidebarWidth),
+        rightPanelOpen: state.rightPanelOpen,
+        rightPanelWidth: clampRightPanelWidth(state.rightPanelWidth),
+        workingFolderSheetOpen: state.workingFolderSheetOpen,
+        workingFolderPanelWidth: clampWorkingFolderPanelWidth(state.workingFolderPanelWidth),
+        bottomTerminalDockOpenByProjectId: state.bottomTerminalDockOpenByProjectId,
+        bottomTerminalDockHeight: clampBottomTerminalDockHeight(state.bottomTerminalDockHeight)
+      }),
+      merge: (persisted, current) => {
+        const state = persisted as Partial<UIStore>
+        return {
+          ...current,
+          ...state,
+          toolbarCollapsedByDefault: undefined,
+          leftSidebarOpen:
+            typeof state.leftSidebarOpen === 'boolean'
+              ? state.leftSidebarOpen
+              : !(state as { toolbarCollapsedByDefault?: boolean }).toolbarCollapsedByDefault,
+          leftSidebarWidth: clampLeftSidebarWidth(
+            state.leftSidebarWidth ?? current.leftSidebarWidth
+          ),
+          rightPanelWidth: clampRightPanelWidth(state.rightPanelWidth ?? current.rightPanelWidth),
+          rightPanelTabs: getDefaultRightPanelTabs(),
+          rightPanelActiveTabId: RIGHT_PANEL_REVIEW_TAB_ID,
+          rightPanelTab: 'preview',
+          rightPanelSection: 'execution',
+          browserStatesBySession:
+            state.browserStatesBySession ?? current.browserStatesBySession ?? {},
+          browserWebviewRefsBySession: current.browserWebviewRefsBySession ?? {},
+          messageListViewStatesBySession:
+            state.messageListViewStatesBySession ?? current.messageListViewStatesBySession ?? {},
+          autoModelSelectionsBySession:
+            state.autoModelSelectionsBySession ?? current.autoModelSelectionsBySession ?? {},
+          autoModelHighConfidenceSelectionsBySession:
+            state.autoModelHighConfidenceSelectionsBySession ??
+            current.autoModelHighConfidenceSelectionsBySession ??
+            {},
+          autoModelRoutingStatesBySession:
+            state.autoModelRoutingStatesBySession ?? current.autoModelRoutingStatesBySession ?? {},
+          planModesBySession: state.planModesBySession ?? current.planModesBySession ?? {},
+          workingFolderPanelWidth: clampWorkingFolderPanelWidth(
+            state.workingFolderPanelWidth ?? current.workingFolderPanelWidth
+          ),
+          bottomTerminalDockHeight: clampBottomTerminalDockHeight(
+            state.bottomTerminalDockHeight ?? current.bottomTerminalDockHeight
+          )
+        }
+      }
+    }
+  )
+)

@@ -1,0 +1,136 @@
+{
+  "action": {
+    "cancel": "Cancel",
+    "delete": "Delete",
+    "save": "Save",
+    "confirm": "Confirm",
+    "close": "Close",
+    "copy": "Copy",
+    "copyPath": "Copy Path",
+    "rename": "Rename",
+    "refresh": "Refresh",
+    "retry": "Retry",
+    "send": "Send",
+    "stop": "Stop",
+    "start": "Start",
+    "clear": "Clear",
+    "allow": "Allow",
+    "deny": "Deny",
+    "undo": "Undo",
+    "open": "Open",
+    "export": "Export",
+    "import": "Import",
+    "duplicate": "Duplicate",
+    "pin": "Pin",
+    "unpin": "Unpin",
+    "showMore": "Show more",
+    "showLess": "Show less"
+  },
+  "status": {
+    "running": "running",
+    "done": "done",
+    "pending": "pending",
+    "active": "active",
+    "completed": "completed",
+    "working": "working",
+    "idle": "idle",
+    "waiting": "waiting",
+    "stopped": "stopped",
+    "failed": "failed",
+    "error": "Error"
+  },
+  "time": {
+    "justNow": "just now",
+    "mAgo": "{{count}}m ago",
+    "hAgo": "{{count}}h ago",
+    "dAgo": "{{count}}d ago",
+    "sAgo": "{{count}}s ago",
+    "sSession": "{{count}}s session",
+    "mSession": "{{count}}m session",
+    "hmSession": "{{h}}h{{m}}m session"
+  },
+  "unit": {
+    "tokens": "tokens",
+    "cached": "cached",
+    "reasoning": "reasoning",
+    "messages": "messages",
+    "turns": "turns",
+    "members": "members",
+    "tasks": "tasks",
+    "items": "items",
+    "lines": "lines",
+    "files": "files",
+    "folders": "folders",
+    "calls": "calls",
+    "deps": "deps",
+    "chars": "chars",
+    "matches": "matches",
+    "sessions": "sessions",
+    "msgs": "msgs"
+  },
+  "priority": {
+    "high": "high",
+    "medium": "medium",
+    "low": "low"
+  },
+  "theme": {
+    "light": "light",
+    "dark": "dark",
+    "system": "system"
+  },
+  "mode": {
+    "chat": "Chat",
+    "clarify": "Clarify",
+    "agent": "Agent",
+    "code": "Code",
+    "acp": "ACP"
+  },
+  "contextWindow": "Context window",
+  "app": {
+    "cron": {
+      "status": {
+        "success": "✅ Success",
+        "error": "❌ Failed",
+        "stopped": "⚠️ Stopped"
+      },
+      "toolCallCount": "{{count}} tool calls",
+      "runFinished": "Cron task \"{{jobName}}\" completed ({{statusLabel}}, {{toolCallLabel}})",
+      "errorDetail": "**Error:** {{message}}",
+      "noOutput": "(no output)"
+    },
+    "changelog": {
+      "title": "Changelog",
+      "translate": "AI Translate",
+      "translating": "Translating...",
+      "showOriginal": "Show Original",
+      "showTranslation": "Show Translation",
+      "translateError": "Translation failed",
+      "noProvider": "No AI provider configured. Set up a provider in Settings first."
+    },
+    "update": {
+      "availableTitle": "🎉 Version {{version}} is available",
+      "availableDescription": "Click \"Update now\" to start downloading",
+      "buttonLabel": "Update v{{version}}",
+      "buttonTooltip": "A new version is available. Click to view release notes.",
+      "currentVersion": "Current v{{version}}",
+      "latestVersion": "Latest v{{version}}",
+      "releaseNotes": "Release notes",
+      "noReleaseNotes": "No release notes were provided for this version.",
+      "downloading": "Downloading update...",
+      "downloadingShort": "{{progress}}%",
+      "downloadingProgress": "Downloading update {{progress}}%",
+      "actions": {
+        "updateNow": "Update now",
+        "remindLater": "Remind me later"
+      },
+      "downloadFailed": "Download failed",
+      "delayed": "Update postponed",
+      "downloadedTitle": "Update downloaded",
+      "downloadedDescription": "Version {{version}} will install after restart",
+      "failed": "Update failed"
+    },
+    "errors": {
+      "unhandledTitle": "Unhandled Error"
+    }
+  }
+}

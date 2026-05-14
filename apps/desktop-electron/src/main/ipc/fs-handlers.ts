@@ -1,0 +1,1856 @@
+import { ipcMain, dialog, BrowserWindow, app } from 'electron'
+import { spawn } from 'child_process'
+import * as fs from 'fs'
+import * as path from 'path'
+import { Glob } from 'glob'
+import { createInterface } from 'readline'
+import { recordLocalTextWriteChange } from './agent-change-handlers'
+import { safeSendToWindow } from '../window-ipc'
+import { createGitIgnoreMatcher } from './gitignore-utils'
+import { getJsAgentRuntimeManager } from './js-agent-runtime-manager'
+
+const IMAGE_EXTENSIONS = new Set([
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.gif',
+  '.bmp',
+  '.webp',
+  '.ico',
+  '.tiff',
+  '.heic',
+  '.heif'
+])
+
+const IMAGE_MIME_TYPES: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.bmp': 'image/bmp',
+  '.webp': 'image/webp',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.tiff': 'image/tiff',
+  '.heic': 'image/heic',
+  '.heif': 'image/heif'
+}
+
+const MAX_FILE_READ_BYTES = 50 * 1024 * 1024 // 50 MB
+const MAX_IMAGE_READ_BYTES = 20 * 1024 * 1024 // 20 MB
+const MAX_LIST_DIR_ITEMS = 1_000
+const MAX_GLOB_MATCHES = 1_000
+const SEARCH_TOOL_MAX_RESULTS = 20
+
+async function assertFileSize(filePath: string, limit: number): Promise<number> {
+  const stat = await fs.promises.stat(filePath)
+  if (stat.size > limit) {
+    throw new Error(
+      `File too large (${(stat.size / 1024 / 1024).toFixed(1)} MB, limit ${(limit / 1024 / 1024).toFixed(0)} MB): ${filePath}`
+    )
+  }
+  return stat.size
+}
+
+const FILE_SEARCH_CACHE_TTL_MS = 5_000
+const FILE_SEARCH_MAX_RESULTS = 20
+const FILE_SEARCH_CACHE_MAX_ENTRIES = 50
+const fileSearchCache = new Map<string, { expiresAt: number; files: string[] }>()
+const FILE_OPERATION_RETRY_DELAYS_MS = [40, 120, 250, 500, 1_000]
+
+type GrepMatchKind = 'match' | 'context'
+type GrepOutputMode = 'matches' | 'files_with_matches' | 'count'
+type GrepPathStyle = 'relative' | 'absolute'
+type GrepResultItem = {
+  file: string
+  line?: number
+  text?: string
+  kind?: GrepMatchKind
+  count?: number
+}
+type GrepLimitReason = 'max_results' | 'max_output_bytes' | 'timeout' | null
+type SearchBackend = 'local' | 'ssh' | 'cron'
+type SearchPathStyle = 'absolute' | 'relative_to_search_root'
+
+type SearchMeta = {
+  backend: SearchBackend
+  searchRoot: string
+  pathStyle: SearchPathStyle
+  truncated: boolean
+  timedOut: boolean
+  limitReason: GrepLimitReason
+  pattern: string
+  include?: string | null
+  exclude?: string | null
+  outputMode?: GrepOutputMode
+  hiddenIncluded: boolean
+  ignoredDefaultsApplied: boolean
+  respectGitignore?: boolean
+  followSymlinks?: boolean
+  searchTime?: number
+  warnings?: string[]
+  maxDepth?: number | null
+  beforeContext?: number
+  afterContext?: number
+  maxResults?: number
+  maxOutputBytes?: number
+  maxLineLength?: number
+}
+
+type GlobToolResult = {
+  kind: 'glob'
+  matches: Array<{ path: string; type?: 'file' | 'directory' }>
+  meta: SearchMeta
+  error?: string
+}
+
+type GrepToolResult = {
+  kind: 'grep'
+  matches: Array<{
+    path: string
+    line?: number
+    text?: string
+    kind?: GrepMatchKind
+    count?: number
+  }>
+  meta: SearchMeta
+  error?: string
+}
+
+type FileOperationError = NodeJS.ErrnoException & { message: string }
+
+interface GrepCollector {
+  results: GrepResultItem[]
+  append: (filePath: string, line: number, text: string, kind?: GrepMatchKind) => boolean
+  appendFile: (filePath: string) => boolean
+  appendCount: (filePath: string, count: number) => boolean
+  readonly limitReason: GrepLimitReason
+  readonly truncated: boolean
+}
+
+type GrepSearchOptions = {
+  pattern: string
+  include?: string
+  exclude?: string
+  includePatterns: string[]
+  excludePatterns: string[]
+  caseSensitive: boolean
+  smartCase: boolean
+  literal: boolean
+  word: boolean
+  line: boolean
+  invertMatch: boolean
+  beforeContext: number
+  afterContext: number
+  maxResults: number
+  maxOutputBytes: number
+  maxLineLength: number
+  maxDepth: number | null
+  hidden: boolean
+  respectGitignore: boolean
+  followSymlinks: boolean
+  outputMode: GrepOutputMode
+  pathStyle: GrepPathStyle
+}
+
+const GREP_IGNORE_DIR_NAMES = [
+  'node_modules',
+  '.git',
+  '.svn',
+  '.hg',
+  '.bzr',
+  'dist',
+  'build',
+  'out',
+  '.next',
+  '.nuxt',
+  '.output',
+  'coverage',
+  '.nyc_output',
+  '.cache',
+  '.parcel-cache',
+  'vendor',
+  'target',
+  'bin',
+  'obj',
+  '.gradle',
+  '__pycache__',
+  '.pytest_cache',
+  '.mypy_cache',
+  '.venv',
+  'venv',
+  'env'
+]
+const GREP_IGNORE_DIRS = new Set(GREP_IGNORE_DIR_NAMES)
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function buildGlobIgnorePatterns(pattern: string): string[] {
+  const normalizedPattern = pattern.replace(/\\/g, '/')
+  const ignorePatterns: string[] = []
+
+  for (const dirName of GREP_IGNORE_DIRS) {
+    const targetsDir = new RegExp(`(^|/)${escapeRegex(dirName)}(/|$)`).test(normalizedPattern)
+    if (targetsDir) continue
+
+    ignorePatterns.push(`${dirName}`)
+    ignorePatterns.push(`${dirName}/**`)
+    ignorePatterns.push(`**/${dirName}`)
+    ignorePatterns.push(`**/${dirName}/**`)
+  }
+
+  return ignorePatterns
+}
+
+function isDefaultIgnoredDirName(name: string): boolean {
+  return GREP_IGNORE_DIRS.has(name.toLowerCase())
+}
+
+function includesDefaultIgnoredDir(filePath: string, searchRoot: string): boolean {
+  const absolutePath = path.resolve(searchRoot, filePath)
+  const relativePath = path.relative(searchRoot, absolutePath)
+  if (!relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath)) return false
+  return relativePath.split(/[\\/]+/).some((part) => isDefaultIgnoredDirName(part))
+}
+
+const GREP_BINARY_EXTENSIONS = new Set([
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.gif',
+  '.bmp',
+  '.webp',
+  '.ico',
+  '.mp4',
+  '.avi',
+  '.mov',
+  '.mkv',
+  '.mp3',
+  '.wav',
+  '.flac',
+  '.zip',
+  '.tar',
+  '.gz',
+  '.rar',
+  '.7z',
+  '.exe',
+  '.dll',
+  '.so',
+  '.dylib',
+  '.pdf',
+  '.doc',
+  '.docx',
+  '.xls',
+  '.xlsx',
+  '.ppt',
+  '.pptx',
+  '.woff',
+  '.woff2',
+  '.ttf',
+  '.eot',
+  '.otf',
+  '.db',
+  '.sqlite',
+  '.sqlite3'
+])
+
+const GREP_DEFAULT_MAX_RESULTS = SEARCH_TOOL_MAX_RESULTS
+const GREP_MAX_RESULTS = 200
+const GREP_MAX_FILE_SIZE = 10 * 1024 * 1024
+const GREP_TIMEOUT_MS = 30000
+const GREP_DEFAULT_MAX_LINE_LENGTH = 160
+const GREP_MAX_LINE_LENGTH = 1000
+const GREP_DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024
+const GREP_MAX_OUTPUT_BYTES = 64 * 1024
+const GREP_MAX_CONTEXT_LINES = 20
+const GREP_MAX_DEPTH = 50
+
+function parseGlobPatterns(value?: string): string[] {
+  return (value ?? '')
+    .split(',')
+    .map((pattern) => pattern.trim())
+    .filter(Boolean)
+}
+
+function normalizeGrepLine(text: string, maxLineLength: number): string {
+  const normalized = text.trim()
+  if (normalized.length <= maxLineLength) return normalized
+  return `${normalized.slice(0, Math.max(0, maxLineLength - 3))}...`
+}
+
+function createIncludeMatcher(
+  searchRoot: string,
+  includePatterns: string[]
+): (filePath: string) => boolean {
+  if (includePatterns.length === 0) return () => true
+
+  const includeRegexCache = new Map<string, RegExp>()
+  const escapeRegExp = (value: string): string => value.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+
+  const toIncludeRegex = (globPattern: string): RegExp => {
+    const cached = includeRegexCache.get(globPattern)
+    if (cached) return cached
+
+    const pattern = globPattern.replace(/\\/g, '/')
+    const escaped = escapeRegExp(pattern)
+    const regexBody = escaped
+      .replace(/\*\*/g, '__DOUBLE_STAR__')
+      .replace(/\*/g, '[^/]*')
+      .replace(/__DOUBLE_STAR__/g, '.*')
+      .replace(/\?/g, '.')
+
+    const compiled = new RegExp(`^${regexBody}$`, 'i')
+    includeRegexCache.set(globPattern, compiled)
+    return compiled
+  }
+
+  return (filePath: string): boolean => {
+    const relPath = path.relative(searchRoot, filePath).replace(/\\/g, '/')
+    const fileName = path.basename(filePath)
+    const ext = path.extname(filePath).toLowerCase()
+
+    return includePatterns.some((rawPattern) => {
+      let pattern = rawPattern.replace(/\\/g, '/')
+      if (pattern.startsWith('./')) pattern = pattern.slice(2)
+      if (pattern.startsWith('**/')) pattern = pattern.slice(3)
+
+      if (pattern.startsWith('*.') && !pattern.includes('/')) {
+        return ext === pattern.slice(1).toLowerCase()
+      }
+
+      if (!pattern.includes('*') && !pattern.includes('?')) {
+        const lowered = pattern.toLowerCase()
+        return (
+          fileName.toLowerCase() === lowered || relPath.toLowerCase() === lowered || ext === lowered
+        )
+      }
+
+      const regexPattern = toIncludeRegex(pattern)
+      return regexPattern.test(relPath) || regexPattern.test(fileName)
+    })
+  }
+}
+
+function normalizeRipgrepGlob(pattern: string): string {
+  let normalized = pattern.replace(/\\/g, '/')
+  if (normalized.startsWith('./')) normalized = normalized.slice(2)
+  if (normalized.startsWith('**/')) normalized = normalized.slice(3)
+  if (!normalized.includes('*') && !normalized.includes('?') && normalized.startsWith('.')) {
+    return `*${normalized}`
+  }
+  return normalized
+}
+
+function clampGrepNumber(value: unknown, fallback: number, max: number): number {
+  if (!Number.isFinite(value)) return fallback
+  const normalized = Math.floor(Number(value))
+  if (normalized <= 0) return fallback
+  return Math.min(normalized, max)
+}
+
+function clampGrepOptionalNumber(value: unknown, max: number): number | null {
+  if (!Number.isFinite(value)) return null
+  const normalized = Math.floor(Number(value))
+  if (normalized <= 0) return null
+  return Math.min(normalized, max)
+}
+
+function clampGrepContext(value: unknown): number {
+  if (!Number.isFinite(value)) return 0
+  const normalized = Math.floor(Number(value))
+  if (normalized <= 0) return 0
+  return Math.min(normalized, GREP_MAX_CONTEXT_LINES)
+}
+
+function normalizeBoolean(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback
+}
+
+function normalizeGrepOutputMode(value: unknown): GrepOutputMode {
+  return value === 'files_with_matches' || value === 'count' ? value : 'matches'
+}
+
+function normalizeGrepPathStyle(value: unknown): GrepPathStyle {
+  return value === 'absolute' ? 'absolute' : 'relative'
+}
+
+function normalizeGrepOptions(args: {
+  pattern?: unknown
+  include?: unknown
+  exclude?: unknown
+  caseSensitive?: unknown
+  smartCase?: unknown
+  literal?: unknown
+  word?: unknown
+  line?: unknown
+  invertMatch?: unknown
+  context?: unknown
+  beforeContext?: unknown
+  afterContext?: unknown
+  maxResults?: unknown
+  limit?: unknown
+  maxOutputBytes?: unknown
+  maxLineLength?: unknown
+  maxDepth?: unknown
+  hidden?: unknown
+  respectGitignore?: unknown
+  followSymlinks?: unknown
+  outputMode?: unknown
+  pathStyle?: unknown
+}): GrepSearchOptions {
+  const pattern = String(args.pattern ?? '')
+  const smartCase = normalizeBoolean(args.smartCase, false)
+  const hasExplicitCaseSensitive = typeof args.caseSensitive === 'boolean'
+  const caseSensitive = hasExplicitCaseSensitive
+    ? Boolean(args.caseSensitive)
+    : smartCase
+      ? /[A-Z]/.test(pattern)
+      : false
+  const context = clampGrepContext(args.context)
+  const beforeContext =
+    args.beforeContext === undefined ? context : clampGrepContext(args.beforeContext)
+  const afterContext =
+    args.afterContext === undefined ? context : clampGrepContext(args.afterContext)
+  const include = typeof args.include === 'string' ? args.include.trim() : undefined
+  const exclude = typeof args.exclude === 'string' ? args.exclude.trim() : undefined
+
+  return {
+    pattern,
+    include: include || undefined,
+    exclude: exclude || undefined,
+    includePatterns: parseGlobPatterns(include),
+    excludePatterns: parseGlobPatterns(exclude),
+    caseSensitive,
+    smartCase,
+    literal: normalizeBoolean(args.literal, false),
+    word: normalizeBoolean(args.word, false),
+    line: normalizeBoolean(args.line, false),
+    invertMatch: normalizeBoolean(args.invertMatch, false),
+    beforeContext,
+    afterContext,
+    maxResults: clampGrepNumber(
+      args.maxResults ?? args.limit,
+      GREP_DEFAULT_MAX_RESULTS,
+      GREP_MAX_RESULTS
+    ),
+    maxOutputBytes: clampGrepNumber(
+      args.maxOutputBytes,
+      GREP_DEFAULT_MAX_OUTPUT_BYTES,
+      GREP_MAX_OUTPUT_BYTES
+    ),
+    maxLineLength: clampGrepNumber(
+      args.maxLineLength,
+      GREP_DEFAULT_MAX_LINE_LENGTH,
+      GREP_MAX_LINE_LENGTH
+    ),
+    maxDepth: clampGrepOptionalNumber(args.maxDepth, GREP_MAX_DEPTH),
+    hidden: normalizeBoolean(args.hidden, true),
+    respectGitignore: normalizeBoolean(args.respectGitignore, true),
+    followSymlinks: normalizeBoolean(args.followSymlinks, false),
+    outputMode: normalizeGrepOutputMode(args.outputMode),
+    pathStyle: normalizeGrepPathStyle(args.pathStyle)
+  }
+}
+
+function isBasicSidecarGrepOptions(options: GrepSearchOptions): boolean {
+  return (
+    !options.exclude &&
+    !options.caseSensitive &&
+    !options.smartCase &&
+    !options.literal &&
+    !options.word &&
+    !options.line &&
+    !options.invertMatch &&
+    options.beforeContext === 0 &&
+    options.afterContext === 0 &&
+    options.maxResults === GREP_DEFAULT_MAX_RESULTS &&
+    options.maxOutputBytes === GREP_DEFAULT_MAX_OUTPUT_BYTES &&
+    options.maxLineLength === GREP_DEFAULT_MAX_LINE_LENGTH &&
+    options.maxDepth === null &&
+    options.hidden &&
+    options.respectGitignore &&
+    !options.followSymlinks &&
+    options.outputMode === 'matches' &&
+    options.pathStyle === 'relative'
+  )
+}
+
+function formatGrepResultPath(
+  searchRoot: string,
+  filePath: string,
+  pathStyle: GrepPathStyle
+): string {
+  const absolutePath = path.isAbsolute(filePath) ? filePath : path.resolve(searchRoot, filePath)
+  if (pathStyle === 'absolute') return absolutePath
+  return path.relative(searchRoot, absolutePath) || path.basename(absolutePath)
+}
+
+function buildGrepRegex(options: GrepSearchOptions): RegExp {
+  let source = options.literal ? escapeRegex(options.pattern) : options.pattern
+  if (options.word) source = `\\b(?:${source})\\b`
+  if (options.line) source = `^(?:${source})$`
+  return new RegExp(source, options.caseSensitive ? '' : 'i')
+}
+
+function shouldSkipHiddenPath(filePath: string, searchRoot: string): boolean {
+  const relativePath = path.relative(searchRoot, path.resolve(searchRoot, filePath))
+  if (!relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath)) return false
+  return relativePath.split(/[\\/]+/).some((part) => part.startsWith('.') && part !== '.')
+}
+
+function createSearchMeta(args: {
+  searchRoot: string
+  pattern: string
+  include?: string | null
+  exclude?: string | null
+  outputMode?: GrepOutputMode
+  truncated?: boolean
+  timedOut?: boolean
+  limitReason?: GrepLimitReason
+  searchTime?: number
+  warnings?: string[]
+  maxDepth?: number | null
+  pathStyle?: SearchPathStyle
+  hiddenIncluded?: boolean
+  respectGitignore?: boolean
+  followSymlinks?: boolean
+  beforeContext?: number
+  afterContext?: number
+  maxResults?: number
+  maxOutputBytes?: number
+  maxLineLength?: number
+}): SearchMeta {
+  return {
+    backend: 'local',
+    searchRoot: args.searchRoot,
+    pathStyle: args.pathStyle ?? 'absolute',
+    truncated: args.truncated === true,
+    timedOut: args.timedOut === true,
+    limitReason: args.limitReason ?? null,
+    pattern: args.pattern,
+    include: args.include ?? null,
+    exclude: args.exclude ?? null,
+    outputMode: args.outputMode ?? 'matches',
+    hiddenIncluded: args.hiddenIncluded ?? true,
+    ignoredDefaultsApplied: true,
+    respectGitignore: args.respectGitignore ?? true,
+    followSymlinks: args.followSymlinks ?? false,
+    searchTime: args.searchTime,
+    warnings: args.warnings ?? [],
+    maxDepth: args.maxDepth ?? null,
+    beforeContext: args.beforeContext ?? 0,
+    afterContext: args.afterContext ?? 0,
+    maxResults: args.maxResults,
+    maxOutputBytes: args.maxOutputBytes,
+    maxLineLength: args.maxLineLength
+  }
+}
+
+function createGlobToolResult(args: {
+  searchRoot: string
+  pattern: string
+  matches: Array<{ path: string; type?: 'file' | 'directory' }>
+  truncated?: boolean
+  limitReason?: GrepLimitReason
+  warnings?: string[]
+  error?: string
+}): GlobToolResult {
+  return {
+    kind: 'glob',
+    matches: args.matches,
+    meta: createSearchMeta({
+      searchRoot: args.searchRoot,
+      pattern: args.pattern,
+      truncated: args.truncated,
+      limitReason: args.limitReason,
+      warnings: args.warnings,
+      pathStyle: 'absolute'
+    }),
+    error: args.error
+  }
+}
+
+function createGrepToolResult(args: {
+  searchRoot: string
+  pattern: string
+  include?: string | null
+  exclude?: string | null
+  outputMode?: GrepOutputMode
+  matches: Array<{
+    path: string
+    line?: number
+    text?: string
+    kind?: GrepMatchKind
+    count?: number
+  }>
+  truncated?: boolean
+  timedOut?: boolean
+  limitReason?: GrepLimitReason
+  searchTime?: number
+  warnings?: string[]
+  options?: GrepSearchOptions
+  error?: string
+}): GrepToolResult {
+  const options = args.options
+  return {
+    kind: 'grep',
+    matches: args.matches,
+    meta: createSearchMeta({
+      searchRoot: args.searchRoot,
+      pattern: args.pattern,
+      include: args.include,
+      exclude: args.exclude,
+      outputMode: args.outputMode ?? options?.outputMode,
+      truncated: args.truncated,
+      timedOut: args.timedOut,
+      limitReason: args.limitReason,
+      searchTime: args.searchTime,
+      warnings: args.warnings,
+      pathStyle: options?.pathStyle === 'relative' ? 'relative_to_search_root' : 'absolute',
+      hiddenIncluded: options?.hidden,
+      respectGitignore: options?.respectGitignore,
+      followSymlinks: options?.followSymlinks,
+      maxDepth: options?.maxDepth,
+      beforeContext: options?.beforeContext,
+      afterContext: options?.afterContext,
+      maxResults: options?.maxResults,
+      maxOutputBytes: options?.maxOutputBytes,
+      maxLineLength: options?.maxLineLength
+    }),
+    error: args.error
+  }
+}
+
+function clampToolResultLimit(value: unknown, max: number): number | null {
+  if (!Number.isFinite(value)) return null
+  const normalized = Math.floor(Number(value))
+  if (normalized <= 0) return null
+  return Math.min(normalized, max)
+}
+
+function scoreFileSearchMatch(filePath: string, query: string): number {
+  const normalizedPath = filePath.replace(/\\/g, '/').toLowerCase()
+  const normalizedQuery = query.replace(/\\/g, '/').trim().toLowerCase()
+  if (!normalizedQuery) return Number.POSITIVE_INFINITY
+
+  const fileName = path.basename(normalizedPath)
+  if (fileName === normalizedQuery) return 0
+  if (fileName.startsWith(normalizedQuery)) return 1
+
+  const fileNameIndex = fileName.indexOf(normalizedQuery)
+  if (fileNameIndex >= 0) return 10 + fileNameIndex
+
+  if (normalizedPath === normalizedQuery) return 20
+
+  const pathIndex = normalizedPath.indexOf(normalizedQuery)
+  if (pathIndex >= 0) return 30 + pathIndex
+
+  let cursor = 0
+  let gapScore = 0
+  for (const char of normalizedQuery) {
+    const nextIndex = normalizedPath.indexOf(char, cursor)
+    if (nextIndex < 0) return Number.POSITIVE_INFINITY
+    gapScore += nextIndex - cursor
+    cursor = nextIndex + 1
+  }
+
+  return 100 + gapScore
+}
+
+async function listSearchableFiles(searchRoot: string): Promise<string[]> {
+  const normalizedRoot = path.resolve(searchRoot)
+  const now = Date.now()
+  const cached = fileSearchCache.get(normalizedRoot)
+  if (cached && cached.expiresAt > now) {
+    return cached.files
+  }
+
+  const matcher = await createLocalGitIgnoreContext(normalizedRoot)
+  const files: string[] = []
+
+  const walk = async (dirPath: string): Promise<void> => {
+    const entries = await fs.promises.readdir(dirPath, { withFileTypes: true })
+
+    for (const entry of entries) {
+      const absolutePath = path.join(dirPath, entry.name)
+      if (entry.isDirectory()) {
+        if (isDefaultIgnoredDirName(entry.name)) continue
+        if (await matcher.ignores(absolutePath, true)) continue
+        await walk(absolutePath)
+        continue
+      }
+
+      if (!entry.isFile()) continue
+      if (await matcher.ignores(absolutePath, false)) continue
+
+      files.push(path.relative(normalizedRoot, absolutePath).replace(/\\/g, '/'))
+    }
+  }
+
+  await walk(normalizedRoot)
+
+  fileSearchCache.set(normalizedRoot, {
+    expiresAt: now + FILE_SEARCH_CACHE_TTL_MS,
+    files
+  })
+
+  // Evict oldest entries if cache grows too large
+  if (fileSearchCache.size > FILE_SEARCH_CACHE_MAX_ENTRIES) {
+    const firstKey = fileSearchCache.keys().next().value
+    if (firstKey !== undefined) fileSearchCache.delete(firstKey)
+  }
+
+  return files
+}
+
+async function isBinaryFile(filePath: string): Promise<boolean> {
+  try {
+    const ext = path.extname(filePath).toLowerCase()
+    if (GREP_BINARY_EXTENSIONS.has(ext)) return true
+
+    const handle = await fs.promises.open(filePath, 'r')
+    try {
+      const buffer = Buffer.alloc(512)
+      const { bytesRead } = await handle.read(buffer, 0, 512, 0)
+      for (let i = 0; i < bytesRead; i++) {
+        if (buffer[i] === 0) return true
+      }
+      return false
+    } finally {
+      await handle.close()
+    }
+  } catch {
+    return true
+  }
+}
+
+function isRetryableFileError(error: unknown): error is FileOperationError {
+  if (!(error instanceof Error)) return false
+  const code = (error as FileOperationError).code
+  return code === 'EBUSY' || code === 'EPERM' || code === 'EACCES'
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function withFileOperationRetries<T>(operation: () => T | Promise<T>): Promise<T> {
+  let lastError: unknown
+
+  for (let attempt = 0; attempt <= FILE_OPERATION_RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      return await operation()
+    } catch (error) {
+      lastError = error
+      if (!isRetryableFileError(error) || attempt === FILE_OPERATION_RETRY_DELAYS_MS.length) {
+        throw error
+      }
+      await delay(FILE_OPERATION_RETRY_DELAYS_MS[attempt])
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError))
+}
+
+async function writeTextFileWithRetries(filePath: string, content: string): Promise<void> {
+  await withFileOperationRetries(async () => {
+    await fs.promises.writeFile(filePath, content, 'utf-8')
+  })
+}
+
+async function writeBinaryFileWithRetries(filePath: string, data: Buffer): Promise<void> {
+  await withFileOperationRetries(async () => {
+    await fs.promises.writeFile(filePath, data)
+  })
+}
+
+async function moveFileWithRetries(from: string, to: string): Promise<void> {
+  await withFileOperationRetries(async () => {
+    await fs.promises.rename(from, to)
+  })
+}
+
+function createGrepCollector(searchRoot: string, options: GrepSearchOptions): GrepCollector {
+  const results: GrepResultItem[] = []
+  let totalBytes = 2
+  let limitReason: GrepLimitReason = null
+
+  const appendItem = (candidate: GrepResultItem): boolean => {
+    if (results.length >= options.maxResults) {
+      limitReason ??= 'max_results'
+      return false
+    }
+
+    const candidateBytes = Buffer.byteLength(JSON.stringify(candidate), 'utf8') + 1
+    if (totalBytes + candidateBytes > options.maxOutputBytes) {
+      limitReason ??= 'max_output_bytes'
+      return false
+    }
+
+    results.push(candidate)
+    totalBytes += candidateBytes
+    return true
+  }
+
+  return {
+    results,
+    append(filePath: string, line: number, text: string, kind: GrepMatchKind = 'match'): boolean {
+      return appendItem({
+        file: formatGrepResultPath(searchRoot, filePath, options.pathStyle),
+        line,
+        text: normalizeGrepLine(text, options.maxLineLength),
+        kind
+      })
+    },
+    appendFile(filePath: string): boolean {
+      return appendItem({
+        file: formatGrepResultPath(searchRoot, filePath, options.pathStyle)
+      })
+    },
+    appendCount(filePath: string, count: number): boolean {
+      return appendItem({
+        file: formatGrepResultPath(searchRoot, filePath, options.pathStyle),
+        count
+      })
+    },
+    get limitReason(): GrepLimitReason {
+      return limitReason
+    },
+    get truncated(): boolean {
+      return limitReason !== null
+    }
+  }
+}
+
+async function scanFileForMatches(
+  filePath: string,
+  regex: RegExp,
+  collector: GrepCollector,
+  startTime: number,
+  options: GrepSearchOptions
+): Promise<'continue' | 'limit' | 'timeout'> {
+  const stream = fs.createReadStream(filePath, { encoding: 'utf8' })
+  const rl = createInterface({ input: stream, crlfDelay: Infinity })
+
+  try {
+    let lineNumber = 0
+    let matchedCount = 0
+    let afterContextRemaining = 0
+    const beforeBuffer: Array<{ line: number; text: string }> = []
+    const emittedContextLines = new Set<number>()
+
+    const appendContext = (line: number, text: string): boolean => {
+      if (emittedContextLines.has(line)) return true
+      emittedContextLines.add(line)
+      return collector.append(filePath, line, text, 'context')
+    }
+
+    for await (const line of rl) {
+      lineNumber += 1
+      if (Date.now() - startTime > GREP_TIMEOUT_MS) return 'timeout'
+      let matches = regex.test(line)
+      if (options.invertMatch) matches = !matches
+
+      if (matches) {
+        matchedCount += 1
+
+        if (options.outputMode === 'files_with_matches') {
+          return collector.appendFile(filePath) ? 'continue' : 'limit'
+        }
+
+        if (options.outputMode !== 'count') {
+          for (const contextLine of beforeBuffer) {
+            if (!appendContext(contextLine.line, contextLine.text)) return 'limit'
+          }
+          if (!collector.append(filePath, lineNumber, line, 'match')) return 'limit'
+          afterContextRemaining = options.afterContext
+        }
+      } else if (afterContextRemaining > 0 && options.outputMode === 'matches') {
+        if (!appendContext(lineNumber, line)) return 'limit'
+        afterContextRemaining -= 1
+      }
+
+      if (options.beforeContext > 0) {
+        beforeBuffer.push({ line: lineNumber, text: line })
+        if (beforeBuffer.length > options.beforeContext) beforeBuffer.shift()
+      }
+    }
+
+    if (options.outputMode === 'count' && matchedCount > 0) {
+      return collector.appendCount(filePath, matchedCount) ? 'continue' : 'limit'
+    }
+    return 'continue'
+  } finally {
+    rl.close()
+    stream.destroy()
+  }
+}
+
+async function findLocalGitIgnoreRoot(startDir: string): Promise<string> {
+  let currentDir = path.resolve(startDir)
+
+  while (true) {
+    if (fs.existsSync(path.join(currentDir, '.git'))) {
+      return currentDir
+    }
+
+    const parentDir = path.dirname(currentDir)
+    if (parentDir === currentDir) {
+      return path.resolve(startDir)
+    }
+    currentDir = parentDir
+  }
+}
+
+async function createLocalGitIgnoreContext(
+  searchTarget: string,
+  extraPatterns?: string[]
+): Promise<ReturnType<typeof createGitIgnoreMatcher>> {
+  const baseDir = path.resolve(searchTarget)
+  const gitIgnoreRoot = await findLocalGitIgnoreRoot(baseDir)
+  return createGitIgnoreMatcher({
+    rootDir: gitIgnoreRoot,
+    extraPatterns,
+    readIgnoreFile: async (filePath) => {
+      try {
+        return await fs.promises.readFile(filePath, 'utf8')
+      } catch {
+        return null
+      }
+    }
+  })
+}
+
+async function runSidecarGrepSearch(args: {
+  pattern: string
+  searchTarget: string
+  include?: string
+}): Promise<{
+  results: GrepResultItem[]
+  truncated: boolean
+  timedOut: boolean
+  limitReason: GrepLimitReason
+  searchTime: number
+} | null> {
+  try {
+    const sidecar = getJsAgentRuntimeManager()
+    const ready = await sidecar.ensureStarted()
+    if (!ready) return null
+
+    const result = (await sidecar.request(
+      'fs/grep',
+      {
+        pattern: args.pattern,
+        path: args.searchTarget,
+        include: args.include,
+        ignoredDirs: GREP_IGNORE_DIR_NAMES,
+        maxResults: GREP_DEFAULT_MAX_RESULTS,
+        maxLineLength: GREP_DEFAULT_MAX_LINE_LENGTH,
+        maxOutputBytes: GREP_DEFAULT_MAX_OUTPUT_BYTES,
+        timeoutMs: GREP_TIMEOUT_MS
+      },
+      GREP_TIMEOUT_MS + 5_000
+    )) as {
+      results?: GrepResultItem[]
+      truncated?: boolean
+      timedOut?: boolean
+      limitReason?: GrepLimitReason
+      searchTime?: number
+    }
+
+    if (!Array.isArray(result?.results)) return null
+
+    return {
+      results: result.results,
+      truncated: result.truncated === true,
+      timedOut: result.timedOut === true,
+      limitReason: result.limitReason ?? null,
+      searchTime: typeof result.searchTime === 'number' ? result.searchTime : 0
+    }
+  } catch {
+    return null
+  }
+}
+
+async function runRipgrepSearch(args: {
+  searchRoot: string
+  searchTarget: string
+  targetIsDirectory: boolean
+  options: GrepSearchOptions
+  startTime: number
+}): Promise<{
+  results: GrepResultItem[]
+  truncated: boolean
+  timedOut: boolean
+  limitReason: GrepLimitReason
+} | null> {
+  const collector = createGrepCollector(args.searchRoot, args.options)
+  const rgArgs = [
+    '--line-number',
+    '--color',
+    'never',
+    '--no-messages',
+    '--max-filesize',
+    `${Math.floor(GREP_MAX_FILE_SIZE / (1024 * 1024))}M`
+  ]
+
+  if (args.options.outputMode === 'matches') {
+    rgArgs.unshift('--json')
+    if (args.options.beforeContext > 0) {
+      rgArgs.push('--before-context', String(args.options.beforeContext))
+    }
+    if (args.options.afterContext > 0) {
+      rgArgs.push('--after-context', String(args.options.afterContext))
+    }
+  } else if (args.options.outputMode === 'files_with_matches') {
+    rgArgs.push('--files-with-matches')
+  } else {
+    rgArgs.push('--count')
+  }
+
+  if (args.options.smartCase) {
+    rgArgs.push('--smart-case')
+  } else if (!args.options.caseSensitive) {
+    rgArgs.push('--ignore-case')
+  }
+  if (args.options.literal) rgArgs.push('--fixed-strings')
+  if (args.options.word) rgArgs.push('--word-regexp')
+  if (args.options.line) rgArgs.push('--line-regexp')
+  if (args.options.invertMatch) rgArgs.push('--invert-match')
+  if (args.options.hidden) rgArgs.push('--hidden')
+  if (!args.options.respectGitignore) rgArgs.push('--no-ignore')
+  if (args.options.followSymlinks) rgArgs.push('--follow')
+  if (args.options.maxDepth !== null) rgArgs.push('--max-depth', String(args.options.maxDepth))
+
+  for (const dir of GREP_IGNORE_DIRS) {
+    rgArgs.push('--glob', `!${dir}/**`)
+    rgArgs.push('--glob', `!**/${dir}/**`)
+  }
+
+  for (const includePattern of args.options.includePatterns) {
+    rgArgs.push('--glob', normalizeRipgrepGlob(includePattern))
+  }
+
+  for (const excludePattern of args.options.excludePatterns) {
+    rgArgs.push('--glob', `!${normalizeRipgrepGlob(excludePattern)}`)
+  }
+
+  rgArgs.push(
+    '--',
+    args.options.pattern,
+    args.targetIsDirectory ? '.' : path.basename(args.searchTarget)
+  )
+
+  return await new Promise((resolve) => {
+    const child = spawn('rg', rgArgs, {
+      cwd: args.searchRoot,
+      windowsHide: true
+    })
+
+    let timedOut = false
+    let stdoutBuffer = ''
+    let settled = false
+
+    const finish = (
+      value: {
+        results: GrepResultItem[]
+        truncated: boolean
+        timedOut: boolean
+        limitReason: GrepLimitReason
+      } | null
+    ): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(value)
+    }
+
+    const processLine = (rawLine: string): void => {
+      if (!rawLine.trim()) return
+
+      if (args.options.outputMode !== 'matches') {
+        const line = rawLine.trimEnd()
+        if (args.options.outputMode === 'files_with_matches') {
+          const absolutePath = path.isAbsolute(line) ? line : path.join(args.searchRoot, line)
+          if (includesDefaultIgnoredDir(absolutePath, args.searchRoot)) return
+          if (!collector.appendFile(absolutePath)) child.kill()
+          return
+        }
+
+        const countMatch = line.match(/^(.*?):(\d+)$/)
+        const count = countMatch ? Number(countMatch[2]) : /^\d+$/.test(line) ? Number(line) : null
+        const rawPath = countMatch?.[1] || path.basename(args.searchTarget)
+        if (count == null || count <= 0) return
+        const absolutePath = path.isAbsolute(rawPath)
+          ? rawPath
+          : path.join(args.searchRoot, rawPath)
+        if (includesDefaultIgnoredDir(absolutePath, args.searchRoot)) return
+        if (!collector.appendCount(absolutePath, count)) child.kill()
+        return
+      }
+
+      try {
+        const parsed = JSON.parse(rawLine) as {
+          type?: string
+          data?: { path?: { text?: string }; lines?: { text?: string }; line_number?: number }
+        }
+        if (parsed.type !== 'match' && parsed.type !== 'context') return
+
+        const rawPath = parsed.data?.path?.text
+        const lineNumber = parsed.data?.line_number
+        const text = parsed.data?.lines?.text ?? ''
+        if (typeof rawPath !== 'string' || typeof lineNumber !== 'number') return
+
+        const absolutePath = path.isAbsolute(rawPath)
+          ? rawPath
+          : path.join(args.searchRoot, rawPath)
+        if (includesDefaultIgnoredDir(absolutePath, args.searchRoot)) return
+        if (!collector.append(absolutePath, lineNumber, text, parsed.type as GrepMatchKind)) {
+          child.kill()
+        }
+      } catch {
+        finish(null)
+      }
+    }
+
+    const flushStdout = (flush = false): void => {
+      let newlineIndex = stdoutBuffer.indexOf('\n')
+      while (newlineIndex !== -1 || (flush && stdoutBuffer.length > 0)) {
+        const endIndex = newlineIndex === -1 ? stdoutBuffer.length : newlineIndex
+        const line = stdoutBuffer.slice(0, endIndex)
+        stdoutBuffer = stdoutBuffer.slice(Math.min(endIndex + 1, stdoutBuffer.length))
+        processLine(line)
+        if (settled) return
+        newlineIndex = stdoutBuffer.indexOf('\n')
+      }
+    }
+
+    const remainingTime = Math.max(1000, GREP_TIMEOUT_MS - (Date.now() - args.startTime))
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill()
+    }, remainingTime)
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdoutBuffer += chunk.toString('utf8')
+      flushStdout()
+    })
+
+    child.on('error', () => {
+      finish(null)
+    })
+
+    child.on('close', (code) => {
+      flushStdout(true)
+      if (settled) return
+
+      if (timedOut || collector.truncated) {
+        finish({
+          results: collector.results,
+          truncated: true,
+          timedOut,
+          limitReason: timedOut ? 'timeout' : collector.limitReason
+        })
+        return
+      }
+
+      if (code === 0 || code === 1) {
+        finish({
+          results: collector.results,
+          truncated: false,
+          timedOut: false,
+          limitReason: null
+        })
+        return
+      }
+
+      finish(null)
+    })
+  })
+}
+
+export function registerFsHandlers(): void {
+  ipcMain.handle(
+    'fs:read-file',
+    async (_event, args: { path: string; offset?: number; limit?: number; raw?: boolean }) => {
+      try {
+        const ext = path.extname(args.path).toLowerCase()
+        if (IMAGE_EXTENSIONS.has(ext)) {
+          await assertFileSize(args.path, MAX_IMAGE_READ_BYTES)
+          const buffer = await fs.promises.readFile(args.path)
+          return {
+            type: 'image',
+            mediaType: IMAGE_MIME_TYPES[ext] || 'application/octet-stream',
+            data: buffer.toString('base64')
+          }
+        }
+        await assertFileSize(args.path, MAX_FILE_READ_BYTES)
+        const content = await fs.promises.readFile(args.path, 'utf-8')
+
+        // Default to raw; only format with line numbers when raw is explicitly false
+        if (args.raw !== false) {
+          return content
+        }
+
+        const normalized = content.replace(/\r\n/g, '\n')
+        const lines = normalized.split('\n')
+        const MAX_READ_LINES = 2000
+        const start = Math.max(0, (args.offset ?? 1) - 1)
+        const count = Math.max(0, Math.min(args.limit ?? MAX_READ_LINES, MAX_READ_LINES))
+        const clampedEnd = Math.min(start + count, lines.length)
+        const lineNoWidth = Math.max(6, String(clampedEnd).length)
+        return lines
+          .slice(start, clampedEnd)
+          .map((line, i) => `${String(start + i + 1).padStart(lineNoWidth)}\t${line}`)
+          .join('\n')
+      } catch (err) {
+        return { error: String(err) }
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'fs:write-file',
+    async (
+      _event,
+      args: {
+        path: string
+        content: string
+        changeMeta?: { runId?: string; sessionId?: string; toolUseId?: string; toolName?: string }
+      }
+    ) => {
+      try {
+        const beforeExists = fs.existsSync(args.path)
+        let beforeText: string | undefined
+        if (beforeExists) {
+          try {
+            beforeText = await fs.promises.readFile(args.path, 'utf-8')
+          } catch {
+            // best-effort: skip diff if read fails
+          }
+        }
+        const dir = path.dirname(args.path)
+        if (!fs.existsSync(dir)) {
+          await fs.promises.mkdir(dir, { recursive: true })
+        }
+        await writeTextFileWithRetries(args.path, args.content)
+        recordLocalTextWriteChange({
+          meta: args.changeMeta,
+          filePath: args.path,
+          beforeExists,
+          beforeText,
+          afterText: args.content
+        })
+        return { success: true, op: beforeExists ? 'modify' : 'create' }
+      } catch (err) {
+        return { error: String(err) }
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'fs:list-dir',
+    async (_event, args: { path: string; ignore?: string[]; limit?: number }) => {
+      try {
+        const resolvedPath = path.resolve(args.path)
+        const matcher = await createLocalGitIgnoreContext(resolvedPath, args.ignore)
+        const entries = await fs.promises.readdir(resolvedPath, { withFileTypes: true })
+        const items: Array<{ name: string; type: 'directory' | 'file'; path: string }> = []
+        const limit = clampToolResultLimit(args.limit, MAX_LIST_DIR_ITEMS)
+
+        for (const entry of entries) {
+          const entryPath = path.join(resolvedPath, entry.name)
+          if (await matcher.ignores(entryPath, entry.isDirectory())) continue
+          if (!entry.isDirectory() && !entry.isFile()) continue
+
+          items.push({
+            name: entry.name,
+            type: entry.isDirectory() ? 'directory' : 'file',
+            path: entryPath
+          })
+
+          if (limit !== null && items.length >= limit) break
+        }
+
+        return items
+      } catch (err) {
+        return { error: String(err) }
+      }
+    }
+  )
+
+  ipcMain.handle('fs:mkdir', async (_event, args: { path: string }) => {
+    try {
+      await fs.promises.mkdir(args.path, { recursive: true })
+      return { success: true }
+    } catch (err) {
+      return { error: String(err) }
+    }
+  })
+
+  ipcMain.handle('fs:delete', async (_event, args: { path: string }) => {
+    try {
+      await fs.promises.rm(args.path, { recursive: true, force: true })
+      return { success: true }
+    } catch (err) {
+      return { error: String(err) }
+    }
+  })
+
+  ipcMain.handle('fs:move', async (_event, args: { from: string; to: string }) => {
+    try {
+      await moveFileWithRetries(args.from, args.to)
+      return { success: true }
+    } catch (err) {
+      return { error: String(err) }
+    }
+  })
+
+  ipcMain.handle('fs:select-folder', async (_event, args?: { defaultPath?: string }) => {
+    const win = BrowserWindow.getFocusedWindow()
+    if (!win) return { canceled: true }
+    const defaultPath = args?.defaultPath?.trim()
+    const result = await dialog.showOpenDialog(win, {
+      properties: ['openDirectory'],
+      defaultPath: defaultPath || undefined
+    })
+    if (result.canceled) return { canceled: true }
+    return { path: result.filePaths[0] }
+  })
+
+  ipcMain.handle('fs:list-desktop-directories', async () => {
+    try {
+      const desktopPath = app.getPath('desktop')
+      const desktopName = path.basename(desktopPath) || 'Desktop'
+      const entries = await fs.promises.readdir(desktopPath, { withFileTypes: true })
+      const directories = entries
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => ({
+          name: entry.name,
+          path: path.join(desktopPath, entry.name),
+          isDesktop: false
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+
+      return {
+        desktopPath,
+        directories: [
+          {
+            name: desktopName,
+            path: desktopPath,
+            isDesktop: true
+          },
+          ...directories
+        ]
+      }
+    } catch (err) {
+      return { error: String(err) }
+    }
+  })
+
+  ipcMain.handle(
+    'fs:glob',
+    async (_event, args: { pattern: string; path?: string; limit?: number }) => {
+      const cwd = path.resolve(args.path || process.cwd())
+      try {
+        const matcher = await createLocalGitIgnoreContext(cwd)
+        const filteredMatches: Array<{ path: string; type?: 'file' | 'directory' }> = []
+        const limit = clampToolResultLimit(args.limit, MAX_GLOB_MATCHES)
+        let truncated = false
+        const globber = new Glob(args.pattern, {
+          cwd,
+          mark: true,
+          dot: true,
+          ignore: buildGlobIgnorePatterns(args.pattern)
+        })
+
+        for await (const match of globber) {
+          const isDir = /[\\/]$/.test(match)
+          const normalizedMatch = match.replace(/[\\/]+$/, '')
+          if (!normalizedMatch) continue
+          const absolutePath = path.resolve(cwd, normalizedMatch)
+          if (await matcher.ignores(absolutePath, isDir)) continue
+          filteredMatches.push({ path: absolutePath, type: isDir ? 'directory' : 'file' })
+
+          if (limit !== null && filteredMatches.length >= limit) {
+            truncated = true
+            break
+          }
+        }
+
+        return createGlobToolResult({
+          searchRoot: cwd,
+          pattern: args.pattern,
+          matches: filteredMatches,
+          truncated,
+          limitReason: truncated ? 'max_results' : null
+        })
+      } catch (err) {
+        return createGlobToolResult({
+          searchRoot: cwd,
+          pattern: args.pattern,
+          matches: [],
+          error: String(err)
+        })
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'fs:search-files',
+    async (_event, args: { path: string; query: string; limit?: number }) => {
+      try {
+        const searchRoot = path.resolve(args.path || process.cwd())
+        const normalizedQuery = args.query?.trim() ?? ''
+        const files = await listSearchableFiles(searchRoot)
+        const limit = Math.max(1, Math.min(args.limit ?? FILE_SEARCH_MAX_RESULTS, 100))
+
+        if (!normalizedQuery) {
+          return [...files]
+            .sort((left, right) => left.localeCompare(right, undefined, { sensitivity: 'base' }))
+            .slice(0, limit)
+            .map((filePath) => ({
+              path: filePath,
+              name: path.basename(filePath)
+            }))
+        }
+
+        const topMatches: Array<{ path: string; score: number }> = []
+
+        for (const filePath of files) {
+          const score = scoreFileSearchMatch(filePath, normalizedQuery)
+          if (!Number.isFinite(score)) continue
+
+          const candidate = { path: filePath, score }
+          let insertAt = topMatches.findIndex(
+            (item) =>
+              score < item.score ||
+              (score === item.score &&
+                filePath.localeCompare(item.path, undefined, { sensitivity: 'base' }) < 0)
+          )
+          if (insertAt === -1) insertAt = topMatches.length
+
+          if (insertAt >= limit && topMatches.length >= limit) continue
+          topMatches.splice(insertAt, 0, candidate)
+          if (topMatches.length > limit) topMatches.length = limit
+        }
+
+        return topMatches.map((item) => ({
+          path: item.path,
+          name: path.basename(item.path)
+        }))
+      } catch (err) {
+        return { error: String(err) }
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'fs:grep',
+    async (
+      _event,
+      args: {
+        pattern: string
+        path?: string
+        include?: string
+        exclude?: string
+        caseSensitive?: boolean
+        smartCase?: boolean
+        literal?: boolean
+        word?: boolean
+        line?: boolean
+        invertMatch?: boolean
+        context?: number
+        beforeContext?: number
+        afterContext?: number
+        maxResults?: number
+        limit?: number
+        maxOutputBytes?: number
+        maxLineLength?: number
+        maxDepth?: number
+        hidden?: boolean
+        respectGitignore?: boolean
+        followSymlinks?: boolean
+        outputMode?: GrepOutputMode
+        pathStyle?: GrepPathStyle
+      }
+    ) => {
+      try {
+        const options = normalizeGrepOptions(args)
+        const searchTarget = path.resolve(args.path || process.cwd())
+        const startTime = Date.now()
+
+        let targetStats: fs.Stats
+        try {
+          targetStats = await fs.promises.stat(searchTarget)
+        } catch {
+          return createGrepToolResult({
+            searchRoot: searchTarget,
+            pattern: options.pattern,
+            include: options.include,
+            exclude: options.exclude,
+            outputMode: options.outputMode,
+            matches: [],
+            options,
+            error: `Search path does not exist: ${searchTarget}`
+          })
+        }
+
+        const searchRoot = targetStats.isDirectory() ? searchTarget : path.dirname(searchTarget)
+
+        let regex: RegExp
+        try {
+          regex = buildGrepRegex(options)
+        } catch (err) {
+          return createGrepToolResult({
+            searchRoot,
+            pattern: options.pattern,
+            include: options.include,
+            exclude: options.exclude,
+            outputMode: options.outputMode,
+            matches: [],
+            options,
+            error: `Invalid regex pattern: ${err}`
+          })
+        }
+
+        if (isBasicSidecarGrepOptions(options)) {
+          const sidecarResult = await runSidecarGrepSearch({
+            pattern: options.pattern,
+            searchTarget,
+            include: options.include
+          })
+
+          if (sidecarResult) {
+            return createGrepToolResult({
+              searchRoot,
+              pattern: options.pattern,
+              include: options.include,
+              exclude: options.exclude,
+              outputMode: options.outputMode,
+              matches: sidecarResult.results
+                .filter((item) => !includesDefaultIgnoredDir(item.file, searchRoot))
+                .map((item) => ({
+                  path: formatGrepResultPath(searchRoot, item.file, options.pathStyle),
+                  line: item.line,
+                  text: item.text,
+                  kind: 'match' as const
+                })),
+              truncated: sidecarResult.truncated,
+              timedOut: sidecarResult.timedOut,
+              limitReason: sidecarResult.limitReason,
+              searchTime: sidecarResult.searchTime,
+              options
+            })
+          }
+        }
+
+        const matchesInclude = createIncludeMatcher(searchRoot, options.includePatterns)
+        const matchesExclude =
+          options.excludePatterns.length > 0
+            ? createIncludeMatcher(searchRoot, options.excludePatterns)
+            : () => false
+        const gitIgnoreMatcher =
+          options.respectGitignore && targetStats.isDirectory()
+            ? await createLocalGitIgnoreContext(searchRoot)
+            : null
+
+        const ripgrepResult = await runRipgrepSearch({
+          searchRoot,
+          searchTarget,
+          targetIsDirectory: targetStats.isDirectory(),
+          options,
+          startTime
+        })
+
+        if (ripgrepResult) {
+          return createGrepToolResult({
+            searchRoot,
+            pattern: options.pattern,
+            include: options.include,
+            exclude: options.exclude,
+            outputMode: options.outputMode,
+            matches: ripgrepResult.results.map((item) => ({
+              path: item.file,
+              line: item.line,
+              text: item.text,
+              kind: item.kind,
+              count: item.count
+            })),
+            truncated: ripgrepResult.truncated,
+            timedOut: ripgrepResult.timedOut,
+            limitReason: ripgrepResult.limitReason,
+            searchTime: Date.now() - startTime,
+            options
+          })
+        }
+
+        const collector = createGrepCollector(searchRoot, options)
+        let timedOut = false
+
+        const searchFile = async (filePath: string): Promise<boolean> => {
+          try {
+            if (Date.now() - startTime > GREP_TIMEOUT_MS) {
+              timedOut = true
+              return true
+            }
+
+            const stats = await fs.promises.stat(filePath)
+            if (stats.size > GREP_MAX_FILE_SIZE || stats.size === 0) return false
+            if (gitIgnoreMatcher && (await gitIgnoreMatcher.ignores(filePath, false))) return false
+            if (!options.hidden && shouldSkipHiddenPath(filePath, searchRoot)) return false
+            if (await isBinaryFile(filePath)) return false
+
+            const status = await scanFileForMatches(filePath, regex, collector, startTime, options)
+            if (status === 'timeout') {
+              timedOut = true
+              return true
+            }
+            return status === 'limit'
+          } catch {
+            return false
+          }
+        }
+
+        const walkDir = async (dir: string): Promise<boolean> => {
+          try {
+            if (Date.now() - startTime > GREP_TIMEOUT_MS) {
+              timedOut = true
+              return true
+            }
+
+            const entries = await fs.promises.readdir(dir, { withFileTypes: true })
+            for (const entry of entries) {
+              if (collector.truncated) return true
+
+              const fullPath = path.join(dir, entry.name)
+              const relativeDepth = path.relative(searchRoot, fullPath).split(/[\\/]+/).length - 1
+              if (options.maxDepth !== null && relativeDepth > options.maxDepth) continue
+              if (entry.isDirectory()) {
+                if (isDefaultIgnoredDirName(entry.name)) continue
+                if (!options.hidden && entry.name.startsWith('.')) continue
+                if (gitIgnoreMatcher && (await gitIgnoreMatcher.ignores(fullPath, true))) continue
+                if (await walkDir(fullPath)) return true
+                continue
+              }
+
+              if (entry.isSymbolicLink() && !options.followSymlinks) continue
+              let isFile = entry.isFile()
+              if (!isFile && options.followSymlinks) {
+                try {
+                  isFile = (await fs.promises.stat(fullPath)).isFile()
+                } catch {
+                  isFile = false
+                }
+              }
+              if (!isFile || !matchesInclude(fullPath) || matchesExclude(fullPath)) continue
+              if (await searchFile(fullPath)) return true
+            }
+            return false
+          } catch {
+            return false
+          }
+        }
+
+        if (targetStats.isDirectory()) {
+          await walkDir(searchTarget)
+        } else if (matchesInclude(searchTarget) && !matchesExclude(searchTarget)) {
+          await searchFile(searchTarget)
+        }
+
+        return createGrepToolResult({
+          searchRoot,
+          pattern: options.pattern,
+          include: options.include,
+          exclude: options.exclude,
+          outputMode: options.outputMode,
+          matches: collector.results.map((item) => ({
+            path: item.file,
+            line: item.line,
+            text: item.text,
+            kind: item.kind,
+            count: item.count
+          })),
+          truncated: collector.truncated || timedOut,
+          timedOut,
+          limitReason: timedOut ? 'timeout' : collector.limitReason,
+          searchTime: Date.now() - startTime,
+          options
+        })
+      } catch (err) {
+        const options = normalizeGrepOptions(args)
+        const searchRoot = path.resolve(args.path || process.cwd())
+        return createGrepToolResult({
+          searchRoot,
+          pattern: options.pattern,
+          include: options.include,
+          exclude: options.exclude,
+          outputMode: options.outputMode,
+          matches: [],
+          options,
+          error: String(err)
+        })
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'fs:save-image',
+    async (_event, args: { defaultName: string; dataUrl: string }) => {
+      const win = BrowserWindow.getFocusedWindow()
+      if (!win) return { canceled: true }
+      const result = await dialog.showSaveDialog(win, {
+        defaultPath: args.defaultName,
+        filters: [{ name: 'PNG Image', extensions: ['png'] }]
+      })
+      if (result.canceled || !result.filePath) return { canceled: true }
+      try {
+        const base64 = args.dataUrl.replace(/^data:image\/\w+;base64,/, '')
+        await writeBinaryFileWithRetries(result.filePath, Buffer.from(base64, 'base64'))
+        return { success: true, filePath: result.filePath }
+      } catch (err) {
+        return { error: String(err) }
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'fs:select-save-file',
+    async (_event, args?: { defaultPath?: string; filters?: Electron.FileFilter[] }) => {
+      const win = BrowserWindow.getFocusedWindow()
+      if (!win) return { canceled: true }
+      const result = await dialog.showSaveDialog(win, {
+        defaultPath: args?.defaultPath,
+        filters: args?.filters
+      })
+      if (result.canceled || !result.filePath) return { canceled: true }
+      return { path: result.filePath }
+    }
+  )
+
+  // Binary file read (returns base64)
+  ipcMain.handle('fs:read-file-binary', async (_event, args: { path: string }) => {
+    try {
+      await assertFileSize(args.path, MAX_FILE_READ_BYTES)
+      const buffer = await fs.promises.readFile(args.path)
+      return { data: buffer.toString('base64') }
+    } catch (err) {
+      return { error: String(err) }
+    }
+  })
+
+  // Binary file write (accepts base64)
+  ipcMain.handle('fs:write-file-binary', async (_event, args: { path: string; data: string }) => {
+    try {
+      const dir = path.dirname(args.path)
+      if (!fs.existsSync(dir)) {
+        await fs.promises.mkdir(dir, { recursive: true })
+      }
+      await writeBinaryFileWithRetries(args.path, Buffer.from(args.data, 'base64'))
+      return { success: true }
+    } catch (err) {
+      return { error: String(err) }
+    }
+  })
+
+  // File watching
+  const watchers = new Map<string, fs.FSWatcher>()
+  const debounceTimers = new Map<string, NodeJS.Timeout>()
+
+  ipcMain.handle('fs:watch-file', async (_event, args: { path: string }) => {
+    const filePath = args.path
+    if (watchers.has(filePath)) return { success: true }
+    try {
+      const watcher = fs.watch(filePath, () => {
+        const existing = debounceTimers.get(filePath)
+        if (existing) clearTimeout(existing)
+        debounceTimers.set(
+          filePath,
+          setTimeout(() => {
+            debounceTimers.delete(filePath)
+            const win = BrowserWindow.getAllWindows()[0]
+            if (win) {
+              safeSendToWindow(win, 'fs:file-changed', { path: filePath })
+            }
+          }, 300)
+        )
+      })
+      watchers.set(filePath, watcher)
+      return { success: true }
+    } catch (err) {
+      return { error: String(err) }
+    }
+  })
+
+  ipcMain.handle('fs:unwatch-file', async (_event, args: { path: string }) => {
+    const filePath = args.path
+    const watcher = watchers.get(filePath)
+    if (watcher) {
+      watcher.close()
+      watchers.delete(filePath)
+    }
+    const timer = debounceTimers.get(filePath)
+    if (timer) {
+      clearTimeout(timer)
+      debounceTimers.delete(filePath)
+    }
+    return { success: true }
+  })
+
+  ipcMain.handle(
+    'fs:select-file',
+    async (_event, args?: { filters?: Electron.FileFilter[]; multiSelections?: boolean }) => {
+      const win = BrowserWindow.getFocusedWindow()
+      if (!win) return { canceled: true }
+      const result = await dialog.showOpenDialog(win, {
+        properties: args?.multiSelections ? ['openFile', 'multiSelections'] : ['openFile'],
+        filters: args?.filters ?? [
+          {
+            name: 'Documents',
+            extensions: [
+              'md',
+              'txt',
+              'docx',
+              'pdf',
+              'html',
+              'csv',
+              'json',
+              'xml',
+              'yaml',
+              'yml',
+              'ts',
+              'js',
+              'tsx',
+              'jsx'
+            ]
+          },
+          { name: 'All Files', extensions: ['*'] }
+        ]
+      })
+      if (result.canceled || result.filePaths.length === 0) return { canceled: true }
+      return {
+        path: result.filePaths[0],
+        paths: result.filePaths
+      }
+    }
+  )
+
+  ipcMain.handle('fs:read-document', async (_event, args: { path: string }) => {
+    try {
+      const ext = path.extname(args.path).toLowerCase()
+      if (ext === '.docx') {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const mammoth = require('mammoth') as typeof import('mammoth')
+        const result = await mammoth.extractRawText({ path: args.path })
+        return { content: result.value, name: path.basename(args.path) }
+      }
+      await assertFileSize(args.path, MAX_FILE_READ_BYTES)
+      const content = await fs.promises.readFile(args.path, 'utf-8')
+      return { content, name: path.basename(args.path) }
+    } catch (err) {
+      return { error: String(err) }
+    }
+  })
+}

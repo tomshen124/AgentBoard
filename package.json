@@ -1,0 +1,15 @@
+{
+  "name": "agentboard-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "build": "npm --prefix apps/desktop-electron run build",
+    "dev": "npm --prefix apps/desktop-electron run dev",
+    "preview": "npm --prefix apps/desktop-electron run start",
+    "desktop:dev": "npm --prefix apps/desktop-electron run dev",
+    "desktop:build": "npm --prefix apps/desktop-electron run build",
+    "desktop:install": "npm --prefix apps/desktop-electron install",
+    "sidecar:build": "cargo build -p taskloop-sidecar",
+    "test:core": "cargo test -p taskloop-core -p taskloop-sidecar"
+  }
+}

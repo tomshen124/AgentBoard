@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Package ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos
+            os: macos-latest
+            builder-target: --mac
+            artifact-name: agentboard-macos
+            artifact-path: |
+              apps/desktop-electron/dist/*.dmg
+              apps/desktop-electron/dist/*-mac.zip
+              apps/desktop-electron/dist/latest-mac.yml
+          - name: windows
+            os: windows-latest
+            builder-target: --win
+            artifact-name: agentboard-windows
+            artifact-path: |
+              apps/desktop-electron/dist/*.exe
+              apps/desktop-electron/dist/*.blockmap
+              apps/desktop-electron/dist/latest.yml
+          - name: linux
+            os: ubuntu-latest
+            builder-target: --linux
+            artifact-name: agentboard-linux
+            artifact-path: |
+              apps/desktop-electron/dist/*.AppImage
+              apps/desktop-electron/dist/*.deb
+              apps/desktop-electron/dist/latest-linux.yml
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/desktop-electron/package-lock.json
+
+      - name: Install Electron deps
+        run: npm ci
+        working-directory: apps/desktop-electron
+
+      - name: Typecheck and build renderer
+        run: npm run build
+        working-directory: apps/desktop-electron
+
+      - name: Build sidecar
+        run: cargo build -p taskloop-sidecar --release
+
+      - name: Copy sidecar
+        shell: bash
+        run: |
+          mkdir -p apps/desktop-electron/resources/bin
+          if [ -f target/release/taskloop-sidecar.exe ]; then
+            cp target/release/taskloop-sidecar.exe apps/desktop-electron/resources/bin/
+          else
+            cp target/release/taskloop-sidecar apps/desktop-electron/resources/bin/
+          fi
+
+      - name: Package app
+        run: npx electron-builder ${{ matrix.builder-target }}
+        working-directory: apps/desktop-electron
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact-name }}
+          if-no-files-found: error
+          path: ${{ matrix.artifact-path }}
+
+      - name: Publish GitHub Release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: ${{ matrix.artifact-path }}

@@ -1,0 +1,136 @@
+{
+  "action": {
+    "cancel": "取消",
+    "delete": "删除",
+    "save": "保存",
+    "confirm": "确认",
+    "close": "关闭",
+    "copy": "复制",
+    "copyPath": "复制路径",
+    "rename": "重命名",
+    "refresh": "刷新",
+    "retry": "重试",
+    "send": "发送",
+    "stop": "停止",
+    "start": "开始",
+    "clear": "清除",
+    "allow": "允许",
+    "deny": "拒绝",
+    "undo": "撤销",
+    "open": "打开",
+    "export": "导出",
+    "import": "导入",
+    "duplicate": "复制会话",
+    "pin": "置顶",
+    "unpin": "取消置顶",
+    "showMore": "显示更多",
+    "showLess": "收起"
+  },
+  "status": {
+    "running": "运行中",
+    "done": "完成",
+    "pending": "待处理",
+    "active": "进行中",
+    "completed": "已完成",
+    "working": "工作中",
+    "idle": "空闲",
+    "waiting": "等待中",
+    "stopped": "已停止",
+    "failed": "失败",
+    "error": "错误"
+  },
+  "time": {
+    "justNow": "刚刚",
+    "mAgo": "{{count}}分钟前",
+    "hAgo": "{{count}}小时前",
+    "dAgo": "{{count}}天前",
+    "sAgo": "{{count}}秒前",
+    "sSession": "{{count}}秒会话",
+    "mSession": "{{count}}分钟会话",
+    "hmSession": "{{h}}小时{{m}}分钟会话"
+  },
+  "unit": {
+    "tokens": "tokens",
+    "cached": "缓存",
+    "reasoning": "推理",
+    "messages": "消息",
+    "turns": "轮次",
+    "members": "成员",
+    "tasks": "任务",
+    "items": "项",
+    "lines": "行",
+    "files": "文件",
+    "folders": "文件夹",
+    "calls": "调用",
+    "deps": "依赖",
+    "chars": "字符",
+    "matches": "匹配",
+    "sessions": "会话",
+    "msgs": "消息"
+  },
+  "priority": {
+    "high": "高",
+    "medium": "中",
+    "low": "低"
+  },
+  "theme": {
+    "light": "浅色",
+    "dark": "深色",
+    "system": "跟随系统"
+  },
+  "mode": {
+    "chat": "对话",
+    "clarify": "澄清",
+    "agent": "Agent",
+    "code": "编程",
+    "acp": "ACP"
+  },
+  "contextWindow": "上下文窗口",
+  "app": {
+    "cron": {
+      "status": {
+        "success": "✅ 成功",
+        "error": "❌ 失败",
+        "stopped": "⚠️ 中止"
+      },
+      "toolCallCount": "{{count}} 次工具调用",
+      "runFinished": "Cron 任务 \"{{jobName}}\" 执行完成（{{statusLabel}}，{{toolCallLabel}}）",
+      "errorDetail": "**错误：** {{message}}",
+      "noOutput": "（无输出）"
+    },
+    "changelog": {
+      "title": "更新日志",
+      "translate": "AI 翻译",
+      "translating": "翻译中...",
+      "showOriginal": "显示原文",
+      "showTranslation": "显示翻译",
+      "translateError": "翻译失败",
+      "noProvider": "未配置 AI 服务商，请先在设置中完成配置。"
+    },
+    "update": {
+      "availableTitle": "🎉 新版本 {{version}} 可用",
+      "availableDescription": "点击“立即更新”开始下载",
+      "buttonLabel": "更新 v{{version}}",
+      "buttonTooltip": "发现新版本，点击查看更新内容",
+      "currentVersion": "当前版本 v{{version}}",
+      "latestVersion": "最新版本 v{{version}}",
+      "releaseNotes": "更新说明",
+      "noReleaseNotes": "当前版本未提供更新说明。",
+      "downloading": "开始下载更新...",
+      "downloadingShort": "下载中 {{progress}}%",
+      "downloadingProgress": "正在下载更新 {{progress}}%",
+      "actions": {
+        "updateNow": "立即更新",
+        "remindLater": "稍后提醒"
+      },
+      "downloadFailed": "下载失败",
+      "delayed": "已推迟更新",
+      "downloadedTitle": "更新已下载",
+      "downloadedDescription": "版本 {{version}} 将在重启后安装",
+      "failed": "更新失败"
+    },
+    "errors": {
+      "unhandledTitle": "未处理的错误"
+    }
+  }
+}
