@@ -59,12 +59,33 @@ jobs:
           cache: npm
           cache-dependency-path: apps/desktop-electron/package-lock.json
 
+      - name: Install Linux packaging dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libatk-bridge2.0-0 \
+            libgtk-3-0 \
+            libnss3 \
+            libsecret-1-dev \
+            libx11-dev \
+            libxkbfile-dev \
+            libxss1 \
+            libxtst-dev \
+            rpm \
+            fakeroot
+          sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2
+
       - name: Install Electron deps
-        run: npm ci
+        run: npm ci --foreground-scripts
         working-directory: apps/desktop-electron
 
-      - name: Typecheck and build renderer
-        run: npm run build
+      - name: Typecheck renderer
+        run: npm run typecheck
+        working-directory: apps/desktop-electron
+
+      - name: Build renderer
+        run: npx electron-vite build
         working-directory: apps/desktop-electron
 
       - name: Build sidecar
