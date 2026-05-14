@@ -37,14 +37,6 @@ jobs:
               apps/desktop-electron/dist/*.exe
               apps/desktop-electron/dist/*.blockmap
               apps/desktop-electron/dist/latest.yml
-          - name: linux
-            os: ubuntu-latest
-            builder-target: --linux
-            artifact-name: agentboard-linux
-            artifact-path: |
-              apps/desktop-electron/dist/*.AppImage
-              apps/desktop-electron/dist/*.deb
-              apps/desktop-electron/dist/latest-linux.yml
 
     steps:
       - uses: actions/checkout@v4
@@ -58,24 +50,6 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: apps/desktop-electron/package-lock.json
-
-      - name: Install Linux packaging dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libatk-bridge2.0-0 \
-            libgtk-3-0 \
-            libnss3 \
-            libpng-dev \
-            libsecret-1-dev \
-            libx11-dev \
-            libxkbfile-dev \
-            libxss1 \
-            libxtst-dev \
-            rpm \
-            fakeroot
-          sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2
 
       - name: Install Electron deps
         run: npm ci --foreground-scripts
