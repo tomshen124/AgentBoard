@@ -28,6 +28,7 @@ tmp
 temp
 .taskloop
 CC-Source
+docs
 *.bak-*
 *.bak2-*
 *.bak3-*
