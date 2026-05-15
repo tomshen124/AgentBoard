@@ -79,7 +79,7 @@ jobs:
           fi
 
       - name: Package app
-        run: npx electron-builder ${{ matrix.builder-target }}
+        run: npx electron-builder ${{ matrix.builder-target }} --publish=never
         working-directory: apps/desktop-electron
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
